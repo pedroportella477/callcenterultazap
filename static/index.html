@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Call Center UltaZap</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main id="login-screen" class="login-shell">
+      <section class="login-panel">
+        <div>
+          <p class="eyebrow">WhatsApp Atendimento</p>
+          <h1>Zap do Pedrao</h1>
+          <p class="muted">Painel do operador com ERP, transferencias e finalizacao de atendimento.</p>
+        </div>
+        <form id="login-form" class="form-grid">
+          <label>
+            Usuario
+            <input name="email" value="master" autocomplete="username" required>
+          </label>
+          <label>
+            Senha
+            <input name="password" type="password" value="admin123" autocomplete="current-password" required>
+          </label>
+          <button type="submit">Entrar</button>
+          <p class="hint">Primeiro acesso: master / admin123. Altere a senha padrao apos o primeiro login.</p>
+        </form>
+      </section>
+    </main>
+
+    <main id="app-screen" class="app-shell hidden">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">UZ</span>
+          <div>
+            <strong>CallCenter UltaZap</strong>
+            <small>Painel operacional</small>
+          </div>
+        </div>
+        <nav>
+          <button class="nav-item active" data-view="inbox">Inbox</button>
+          <button class="nav-item" data-view="customers">Clientes</button>
+          <button class="nav-item" data-view="settings">WhatsApp</button>
+        </nav>
+        <div class="user-card">
+          <span id="user-name">Usuario</span>
+          <small id="user-role">perfil</small>
+          <button id="logout-button" type="button">Sair</button>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow" id="scope-label">Fila</p>
+            <h2>Conversas</h2>
+          </div>
+          <div class="top-actions">
+            <input id="search-input" type="search" placeholder="Buscar cliente ou telefone">
+            <select id="status-filter">
+              <option value="">Todos</option>
+              <option value="open">Abertos</option>
+              <option value="pending">Pendentes</option>
+              <option value="closed">Fechados</option>
+            </select>
+            <button id="new-customer-button" type="button">Novo cliente</button>
+          </div>
+        </header>
+
+        <section class="metrics" aria-label="Indicadores">
+          <article><span id="metric-total">0</span><small>Total</small></article>
+          <article><span id="metric-open">0</span><small>Abertos</small></article>
+          <article><span id="metric-pending">0</span><small>Pendentes</small></article>
+          <article><span id="metric-closed">0</span><small>Fechados</small></article>
+        </section>
+
+        <section id="view-inbox" class="main-grid view">
+          <div class="conversation-list" id="customer-list"></div>
+          <article class="chat-panel">
+            <div id="chat-empty" class="empty-state">Selecione uma conversa para atender.</div>
+            <div id="chat-content" class="hidden">
+              <header class="chat-header">
+                <div>
+                  <h3 id="chat-name">Cliente</h3>
+                  <p id="chat-meta" class="muted"></p>
+                </div>
+                <div class="chat-actions">
+                  <select id="assign-select"></select>
+                  <select id="customer-status">
+                    <option value="open">Aberto</option>
+                    <option value="pending">Pendente</option>
+                    <option value="closed">Fechado</option>
+                  </select>
+                  <button id="transfer-button" type="button">Transferir atendimento</button>
+                  <button id="finalize-button" type="button">Finalizar atendimento</button>
+                </div>
+              </header>
+              <section id="erp-panel" class="erp-panel">
+                <p><strong>Painel ERP</strong></p>
+                <p id="erp-summary" class="muted">Sem dados ERP.</p>
+                <pre id="erp-connection" class="erp-connection"></pre>
+                <div class="button-row">
+                  <button id="send-boleto-button" type="button">Enviar boleto</button>
+                  <button id="unlock-billing-button" type="button">Desbloquear cobranca</button>
+                </div>
+              </section>
+              <div id="message-list" class="message-list"></div>
+              <form id="message-form" class="composer">
+                <textarea name="body" placeholder="Digite a resposta" rows="2" required></textarea>
+                <button type="submit">Enviar</button>
+              </form>
+            </div>
+          </article>
+        </section>
+
+        <section id="view-customers" class="view hidden">
+          <div class="table-panel">
+            <table>
+              <thead>
+                <tr>
+                  <th>Cliente</th>
+                  <th>Telefone</th>
+                  <th>Fila</th>
+                  <th>Operador</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="customers-table"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="view-settings" class="view hidden">
+          <div class="settings-grid">
+            <article class="settings-panel">
+              <h3>Integracao Evolution API</h3>
+              <p class="muted">Configure variaveis de ambiente e use as acoes para provisionar instancia e webhook.</p>
+              <dl class="config-list">
+                <dt>URL base</dt><dd id="evolution-base">-</dd>
+                <dt>Instancia</dt><dd id="evolution-instance">-</dd>
+                <dt>Status</dt><dd id="evolution-configured">-</dd>
+              </dl>
+              <div class="button-row">
+                <button id="create-instance-button" type="button">Criar instancia</button>
+              </div>
+            </article>
+            <article class="settings-panel">
+              <h3>Webhook publico</h3>
+              <form id="webhook-form" class="form-grid">
+                <label>
+                  URL publica
+                  <input name="public_url" type="url" placeholder="https://seu-dominio.com" required>
+                </label>
+                <button type="submit">Configurar webhook</button>
+              </form>
+            </article>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <dialog id="customer-dialog">
+      <form id="customer-form" method="dialog" class="form-grid">
+        <h3>Novo cliente</h3>
+        <label>Nome <input name="name" required></label>
+        <label>Telefone <input name="phone" placeholder="5511999999999" required></label>
+        <label>Fila <select name="queue_id" required></select></label>
+        <label class="admin-only hidden">Operador <select name="assigned_operator_id"></select></label>
+        <div class="button-row">
+          <button type="button" id="cancel-customer-button">Cancelar</button>
+          <button type="submit">Salvar</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
