@@ -75,6 +75,8 @@ Recomendacao: altere a senha padrao apos o primeiro login.
 - Troca de senha obrigatoria para credencial padrao em `POST /api/change-password`.
 - Rate limit de tentativas de login (retorno `429` com `Retry-After`).
 - Limite de payload JSON para reduzir risco de abuso (`413`).
+- Atualizacao em tempo real via SSE em `GET /api/events`.
+- SLA operacional em `GET /api/sla` (resumo + visao por fila).
 
 ## Integracao completa com ERPs
 
@@ -134,3 +136,7 @@ Variaveis de ambiente uteis:
 - `LOGIN_RATE_LIMIT_ATTEMPTS`: numero maximo de tentativas de login por janela (default `8`)
 - `LOGIN_RATE_LIMIT_WINDOW_SECONDS`: janela de rate limit do login em segundos (default `300`)
 - `WEBHOOK_PROCESSED_RETENTION_SECONDS`: retencao de eventos processados em segundos (default `604800`)
+- `WEBHOOK_MAX_ATTEMPTS`: maximo de tentativas de processamento antes de dead-letter logico (default `5`)
+- `DEFAULT_SLA_FIRST_RESPONSE_SECONDS`: alvo de SLA para 1a resposta (default `900`)
+- `SSE_KEEPALIVE_SECONDS`: intervalo de keepalive SSE (default `15`)
+- `SSE_SUBSCRIBER_QUEUE_MAX`: backlog maximo por assinante SSE (default `200`)

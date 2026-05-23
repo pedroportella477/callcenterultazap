@@ -48,6 +48,12 @@ LOGIN_RATE_LIMIT_WINDOW_SECONDS = env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300
 WEBHOOK_PROCESSED_RETENTION_SECONDS = env_int(
     "WEBHOOK_PROCESSED_RETENTION_SECONDS", 604800, minimum=3600, maximum=31536000
 )
+WEBHOOK_MAX_ATTEMPTS = env_int("WEBHOOK_MAX_ATTEMPTS", 5, minimum=1, maximum=50)
+DEFAULT_SLA_FIRST_RESPONSE_SECONDS = env_int(
+    "DEFAULT_SLA_FIRST_RESPONSE_SECONDS", 900, minimum=60, maximum=86400
+)
+SSE_KEEPALIVE_SECONDS = env_int("SSE_KEEPALIVE_SECONDS", 15, minimum=5, maximum=120)
+SSE_SUBSCRIBER_QUEUE_MAX = env_int("SSE_SUBSCRIBER_QUEUE_MAX", 200, minimum=10, maximum=5000)
 
 SESSIONS = {}
 SESSIONS_LOCK = threading.RLock()
@@ -62,9 +68,14 @@ METRICS = {
     "webhook_queue_dropped_total": 0,
     "webhook_reprocessed_total": 0,
     "webhook_failed_total": 0,
+    "webhook_dead_lettered_total": 0,
     "messages_processed_total": 0,
     "login_rate_limited_total": 0,
 }
+EVENT_SUBSCRIBERS = {}
+EVENT_SUBSCRIBERS_LOCK = threading.Lock()
+EVENT_SUBSCRIBER_SEQ = 0
+EVENT_ID_SEQ = 0
 
 
 class APIError(Exception):
@@ -152,6 +163,67 @@ def login_rate_limit_retry_after(login_value, client_ip, ts=None):
         return max(1, retry_after)
 
 
+def _next_event_id():
+    global EVENT_ID_SEQ
+    with EVENT_SUBSCRIBERS_LOCK:
+        EVENT_ID_SEQ += 1
+        return EVENT_ID_SEQ
+
+
+def _register_event_subscriber(user):
+    global EVENT_SUBSCRIBER_SEQ
+    subscriber = {
+        "id": None,
+        "user_id": user["id"],
+        "role": user["role"],
+        "queue": deque(maxlen=SSE_SUBSCRIBER_QUEUE_MAX),
+        "cond": threading.Condition(),
+    }
+    with EVENT_SUBSCRIBERS_LOCK:
+        EVENT_SUBSCRIBER_SEQ += 1
+        subscriber["id"] = EVENT_SUBSCRIBER_SEQ
+        EVENT_SUBSCRIBERS[subscriber["id"]] = subscriber
+    return subscriber
+
+
+def _unregister_event_subscriber(subscriber):
+    with EVENT_SUBSCRIBERS_LOCK:
+        EVENT_SUBSCRIBERS.pop(subscriber["id"], None)
+    with subscriber["cond"]:
+        subscriber["cond"].notify_all()
+
+
+def _customer_assigned_operator_id(customer_id):
+    with db() as conn:
+        row = conn.execute("select assigned_operator_id from customers where id = ?", (customer_id,)).fetchone()
+    if not row:
+        return None
+    return row["assigned_operator_id"]
+
+
+def publish_realtime_event(event_type, payload, customer_id=None):
+    assigned_operator_id = None
+    if customer_id is not None:
+        assigned_operator_id = _customer_assigned_operator_id(customer_id)
+    event = {
+        "id": _next_event_id(),
+        "event": event_type,
+        "ts": now_ts(),
+        "payload": payload,
+    }
+    with EVENT_SUBSCRIBERS_LOCK:
+        subscribers = list(EVENT_SUBSCRIBERS.values())
+    for subscriber in subscribers:
+        if subscriber["role"] != "admin":
+            if customer_id is None:
+                continue
+            if assigned_operator_id != subscriber["user_id"]:
+                continue
+        with subscriber["cond"]:
+            subscriber["queue"].append(event)
+            subscriber["cond"].notify()
+
+
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
@@ -221,6 +293,9 @@ def init_db():
                 erp_financial_pending integer not null default 0,
                 erp_connection_data text not null default '{}',
                 last_message_at integer,
+                first_response_at integer,
+                closed_at integer,
+                sla_due_at integer,
                 created_at integer not null,
                 foreign key(queue_id) references queues(id),
                 foreign key(assigned_operator_id) references users(id)
@@ -251,6 +326,8 @@ def init_db():
                 event_key text not null unique,
                 payload text not null,
                 processed integer not null default 0,
+                attempts integer not null default 0,
+                last_error text,
                 created_at integer not null,
                 processed_at integer
             );
@@ -285,6 +362,17 @@ def init_db():
             conn.execute("alter table customers add column erp_financial_pending integer not null default 0")
         if "erp_connection_data" not in customer_cols:
             conn.execute("alter table customers add column erp_connection_data text not null default '{}'")
+        if "first_response_at" not in customer_cols:
+            conn.execute("alter table customers add column first_response_at integer")
+        if "closed_at" not in customer_cols:
+            conn.execute("alter table customers add column closed_at integer")
+        if "sla_due_at" not in customer_cols:
+            conn.execute("alter table customers add column sla_due_at integer")
+        webhook_cols = [row["name"] for row in conn.execute("pragma table_info(webhook_events)").fetchall()]
+        if "attempts" not in webhook_cols:
+            conn.execute("alter table webhook_events add column attempts integer not null default 0")
+        if "last_error" not in webhook_cols:
+            conn.execute("alter table webhook_events add column last_error text")
 
         if not conn.execute("select 1 from users limit 1").fetchone():
             admin_hash = password_hash("admin123")
@@ -318,10 +406,23 @@ def init_db():
             conn.executemany(
                 """
                 insert into customers
-                (name, phone, queue_id, assigned_operator_id, status, tags, last_message_at, created_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?)
+                (name, phone, queue_id, assigned_operator_id, status, tags, last_message_at, sla_due_at, created_at)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                [(c[0], c[1], c[2], c[3], c[4], c[5], now_ts(), now_ts()) for c in customers],
+                [
+                    (
+                        c[0],
+                        c[1],
+                        c[2],
+                        c[3],
+                        c[4],
+                        c[5],
+                        now_ts(),
+                        now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS,
+                        now_ts(),
+                    )
+                    for c in customers
+                ],
             )
             for customer in conn.execute("select id, name from customers").fetchall():
                 conn.execute(
@@ -352,6 +453,15 @@ def init_db():
         ).fetchone()
         if master_user and verify_password("admin123", master_user["password_hash"]):
             conn.execute("update users set must_change_password = 1 where id = ?", (master_user["id"],))
+
+        conn.execute(
+            "update customers set sla_due_at = coalesce(sla_due_at, created_at + ?) where sla_due_at is null",
+            (DEFAULT_SLA_FIRST_RESPONSE_SECONDS,),
+        )
+        conn.execute(
+            "update customers set closed_at = coalesce(closed_at, ?) where status = 'closed' and closed_at is null",
+            (now_ts(),),
+        )
 
 
 def log_action(user_id, action, details):
@@ -391,6 +501,8 @@ def metrics_payload():
         queue_depth = len(WEBHOOK_QUEUE)
     with SESSIONS_LOCK:
         active_sessions = len(SESSIONS)
+    with EVENT_SUBSCRIBERS_LOCK:
+        realtime_subscribers = len(EVENT_SUBSCRIBERS)
     lines = [
         "# HELP http_requests_total Total HTTP requests.",
         "# TYPE http_requests_total counter",
@@ -410,6 +522,9 @@ def metrics_payload():
         "# HELP webhook_failed_total Webhook events failed during processing.",
         "# TYPE webhook_failed_total counter",
         f"webhook_failed_total {METRICS['webhook_failed_total']}",
+        "# HELP webhook_dead_lettered_total Webhook events moved out after max processing attempts.",
+        "# TYPE webhook_dead_lettered_total counter",
+        f"webhook_dead_lettered_total {METRICS['webhook_dead_lettered_total']}",
         "# HELP messages_processed_total Inbound messages processed by worker.",
         "# TYPE messages_processed_total counter",
         f"messages_processed_total {METRICS['messages_processed_total']}",
@@ -422,6 +537,9 @@ def metrics_payload():
         "# HELP webhook_queue_depth Current in-memory webhook queue depth.",
         "# TYPE webhook_queue_depth gauge",
         f"webhook_queue_depth {queue_depth}",
+        "# HELP realtime_subscribers Active SSE realtime subscribers.",
+        "# TYPE realtime_subscribers gauge",
+        f"realtime_subscribers {realtime_subscribers}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -488,6 +606,7 @@ def process_inbound_payload(payload):
         return False
     with db() as conn:
         customer = conn.execute("select id from customers where phone = ?", (phone,)).fetchone()
+        created_new_customer = False
         if not customer:
             queue_id = conn.execute("select id from queues order by id limit 1").fetchone()["id"]
             operator = conn.execute(
@@ -504,36 +623,102 @@ def process_inbound_payload(payload):
             cursor = conn.execute(
                 """
                 insert into customers
-                (name, phone, queue_id, assigned_operator_id, status, last_message_at, created_at)
-                values (?, ?, ?, ?, 'open', ?, ?)
+                (name, phone, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
+                values (?, ?, ?, ?, 'open', ?, ?, ?)
                 """,
-                (phone, phone, queue_id, operator["id"] if operator else None, now_ts(), now_ts()),
+                (
+                    phone,
+                    phone,
+                    queue_id,
+                    operator["id"] if operator else None,
+                    now_ts(),
+                    now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS,
+                    now_ts(),
+                ),
             )
             customer_id = cursor.lastrowid
+            created_new_customer = True
         else:
             customer_id = customer["id"]
         conn.execute(
             "insert into messages (customer_id, direction, body, external_id, created_at) values (?, 'inbound', ?, ?, ?)",
             (customer_id, text, str(key.get("id") or ""), now_ts()),
         )
-        conn.execute("update customers set status = 'open', finalized = 0, last_message_at = ? where id = ?", (now_ts(), customer_id))
+        conn.execute(
+            """
+            update customers
+            set status = 'open',
+                finalized = 0,
+                closed_at = null,
+                last_message_at = ?,
+                sla_due_at = coalesce(sla_due_at, ?)
+            where id = ?
+            """,
+            (now_ts(), now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS, customer_id),
+        )
     METRICS["messages_processed_total"] += 1
+    publish_realtime_event(
+        "ticket.updated",
+        {
+            "customer_id": customer_id,
+            "source": "webhook",
+            "kind": "inbound_message",
+            "created_new_customer": created_new_customer,
+        },
+        customer_id=customer_id,
+    )
     return True
+
+
+def next_pending_webhook_event():
+    with db() as conn:
+        row = conn.execute(
+            """
+            select event_key, payload, attempts
+            from webhook_events
+            where processed = 0
+            order by id asc
+            limit 1
+            """
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except json.JSONDecodeError:
+        with db() as conn:
+            conn.execute(
+                "update webhook_events set processed = 1, processed_at = ?, attempts = attempts + 1, last_error = ? where event_key = ?",
+                (now_ts(), "invalid_json_payload", row["event_key"]),
+            )
+        METRICS["webhook_failed_total"] += 1
+        log_structured("webhook.invalid_payload", "-", event_key=row["event_key"])
+        return None
+    return row["event_key"], payload, row["attempts"]
 
 
 def webhook_worker():
     processed_since_cleanup = 0
     while True:
+        event_key = None
+        payload = None
+        attempts = 0
         with WEBHOOK_COND:
-            while not WEBHOOK_QUEUE:
-                WEBHOOK_COND.wait()
-            event_key, payload = WEBHOOK_QUEUE.popleft()
+            if not WEBHOOK_QUEUE:
+                WEBHOOK_COND.wait(timeout=1)
+            if WEBHOOK_QUEUE:
+                event_key, payload = WEBHOOK_QUEUE.popleft()
+        if not event_key:
+            pending = next_pending_webhook_event()
+            if not pending:
+                continue
+            event_key, payload, attempts = pending
         try:
             METRICS["webhook_reprocessed_total"] += 1
             ok = process_inbound_payload(payload)
             with db() as conn:
                 conn.execute(
-                    "update webhook_events set processed = 1, processed_at = ? where event_key = ?",
+                    "update webhook_events set processed = 1, processed_at = ?, last_error = null where event_key = ?",
                     (now_ts(), event_key),
                 )
             if ok:
@@ -546,7 +731,31 @@ def webhook_worker():
                 processed_since_cleanup = 0
         except Exception as exc:
             METRICS["webhook_failed_total"] += 1
+            with db() as conn:
+                conn.execute(
+                    "update webhook_events set attempts = attempts + 1, last_error = ? where event_key = ? and processed = 0",
+                    (str(exc), event_key),
+                )
+                row = conn.execute(
+                    "select attempts from webhook_events where event_key = ?",
+                    (event_key,),
+                ).fetchone()
+                current_attempts = row["attempts"] if row else (attempts + 1)
+                if current_attempts >= WEBHOOK_MAX_ATTEMPTS:
+                    conn.execute(
+                        "update webhook_events set processed = 1, processed_at = ? where event_key = ?",
+                        (now_ts(), event_key),
+                    )
+                    METRICS["webhook_dead_lettered_total"] += 1
+                    log_structured(
+                        "webhook.dead_lettered",
+                        "-",
+                        event_key=event_key,
+                        attempts=current_attempts,
+                        max_attempts=WEBHOOK_MAX_ATTEMPTS,
+                    )
             log_structured("webhook.failed", "-", event_key=event_key, error=str(exc))
+            time.sleep(0.2)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -592,6 +801,53 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def send_sse_event(self, event_name, payload, event_id=None):
+        lines = []
+        if event_id is not None:
+            lines.append(f"id: {event_id}\n")
+        if event_name:
+            lines.append(f"event: {event_name}\n")
+        data = json.dumps(payload, ensure_ascii=False)
+        for line in data.splitlines() or [""]:
+            lines.append(f"data: {line}\n")
+        lines.append("\n")
+        self.wfile.write("".join(lines).encode("utf-8"))
+        self.wfile.flush()
+
+    def api_events_stream(self):
+        user = self.current_user()
+        if not user:
+            self.send_json({"error": "Não autenticado"}, HTTPStatus.UNAUTHORIZED)
+            return
+        subscriber = _register_event_subscriber(user)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Request-ID", self.request_id)
+        self.end_headers()
+        try:
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+            self.send_sse_event("ready", {"ok": True, "ts": now_ts()}, _next_event_id())
+            while True:
+                event = None
+                with subscriber["cond"]:
+                    if not subscriber["queue"]:
+                        subscriber["cond"].wait(timeout=SSE_KEEPALIVE_SECONDS)
+                    if subscriber["queue"]:
+                        event = subscriber["queue"].popleft()
+                if event:
+                    self.send_sse_event(event["event"], event["payload"], event["id"])
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError, OSError):
+            pass
+        finally:
+            _unregister_event_subscriber(subscriber)
 
     def _extract_customer_id(self, path, action):
         parts = path.strip("/").split("/")
@@ -705,6 +961,8 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchone()["total"]
                 with WEBHOOK_COND:
                     queue_depth = len(WEBHOOK_QUEUE)
+                with EVENT_SUBSCRIBERS_LOCK:
+                    realtime_subscribers = len(EVENT_SUBSCRIBERS)
                 self.send_json(
                     {
                         "ok": True,
@@ -712,6 +970,7 @@ class Handler(BaseHTTPRequestHandler):
                         "queue_depth": queue_depth,
                         "pending_webhooks": pending_webhooks,
                         "max_webhook_queue_size": MAX_WEBHOOK_QUEUE_SIZE,
+                        "realtime_subscribers": realtime_subscribers,
                     }
                 )
                 return
@@ -754,8 +1013,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/dashboard":
                 self.api_dashboard()
                 return
+            if path == "/api/sla":
+                self.api_sla()
+                return
             if path == "/api/evolution/status":
                 self.api_evolution_status()
+                return
+            if path == "/api/events":
+                self.api_events_stream()
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except APIError as exc:
@@ -1005,8 +1270,16 @@ class Handler(BaseHTTPRequestHandler):
                 "insert into messages (customer_id, direction, body, status, external_id, created_at) values (?, ?, ?, ?, ?, ?)",
                 (customer_id, "outbound", text, status, external_id, now_ts()),
             )
-            conn.execute("update customers set last_message_at = ? where id = ?", (now_ts(), customer_id))
+            conn.execute(
+                "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+                (now_ts(), now_ts(), customer_id),
+            )
         log_action(user["id"], "message.sent", {"customer_id": customer_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "outbound_message", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True, "status": status})
 
     def api_create_customer(self):
@@ -1059,15 +1332,20 @@ class Handler(BaseHTTPRequestHandler):
                 cursor = conn.execute(
                     """
                     insert into customers
-                    (name, phone, queue_id, assigned_operator_id, status, last_message_at, created_at)
-                    values (?, ?, ?, ?, 'open', ?, ?)
+                    (name, phone, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
+                    values (?, ?, ?, ?, 'open', ?, ?, ?)
                     """,
-                    (name, phone, queue_id, assigned_operator_id, now_ts(), now_ts()),
+                    (name, phone, queue_id, assigned_operator_id, now_ts(), now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS, now_ts()),
                 )
             except sqlite3.IntegrityError:
                 self.send_json({"error": "Telefone já cadastrado"}, HTTPStatus.CONFLICT)
                 return
         log_action(user["id"], "customer.created", {"customer_id": cursor.lastrowid})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": cursor.lastrowid, "kind": "customer_created", "by_user_id": user["id"]},
+            customer_id=cursor.lastrowid,
+        )
         self.send_json({"ok": True, "id": cursor.lastrowid}, HTTPStatus.CREATED)
 
     def api_assign_customer(self, customer_id):
@@ -1098,6 +1376,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             conn.execute("update customers set assigned_operator_id = ? where id = ?", (operator_id, customer_id))
         log_action(user["id"], "customer.assigned", {"customer_id": customer_id, "operator_id": operator_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "assigned", "operator_id": operator_id, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_update_status(self, customer_id):
@@ -1115,8 +1398,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Status inválido"}, HTTPStatus.BAD_REQUEST)
             return
         with db() as conn:
-            conn.execute("update customers set status = ? where id = ?", (status, customer_id))
+            conn.execute(
+                "update customers set status = ?, closed_at = case when ? = 'closed' then ? else null end where id = ?",
+                (status, status, now_ts(), customer_id),
+            )
         log_action(user["id"], "customer.status", {"customer_id": customer_id, "status": status})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "status_changed", "status": status, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_transfer_customer(self, customer_id):
@@ -1141,6 +1432,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             conn.execute("update customers set assigned_operator_id = ?, finalized = 0 where id = ?", (operator_id, customer_id))
         log_action(user["id"], "customer.transferred", {"customer_id": customer_id, "operator_id": operator_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "transferred", "operator_id": operator_id, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_finalize_customer(self, customer_id):
@@ -1150,8 +1446,16 @@ class Handler(BaseHTTPRequestHandler):
         if not self.require_customer_access(user, customer_id):
             return
         with db() as conn:
-            conn.execute("update customers set status = 'closed', finalized = 1 where id = ?", (customer_id,))
+            conn.execute(
+                "update customers set status = 'closed', finalized = 1, closed_at = ? where id = ?",
+                (now_ts(), customer_id),
+            )
         log_action(user["id"], "customer.finalized", {"customer_id": customer_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "finalized", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_customer_erp(self, customer_id):
@@ -1207,8 +1511,16 @@ class Handler(BaseHTTPRequestHandler):
                 "insert into messages (customer_id, direction, body, status, created_at) values (?, 'outbound', ?, 'sent', ?)",
                 (customer_id, "Segue seu boleto atualizado para regularização.", now_ts()),
             )
-            conn.execute("update customers set last_message_at = ? where id = ?", (now_ts(), customer_id))
+            conn.execute(
+                "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+                (now_ts(), now_ts(), customer_id),
+            )
         log_action(user["id"], "billing.boleto_sent", {"customer_id": customer_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "boleto_sent", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_unlock_billing(self, customer_id):
@@ -1228,8 +1540,16 @@ class Handler(BaseHTTPRequestHandler):
                 "insert into messages (customer_id, direction, body, status, created_at) values (?, 'system', ?, 'sent', ?)",
                 (customer_id, "Desbloqueio em cobrança solicitado pelo operador.", now_ts()),
             )
-            conn.execute("update customers set last_message_at = ? where id = ?", (now_ts(), customer_id))
+            conn.execute(
+                "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+                (now_ts(), now_ts(), customer_id),
+            )
         log_action(user["id"], "billing.unlocked", {"customer_id": customer_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "billing_unlocked", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
         self.send_json({"ok": True})
 
     def api_operators(self):
@@ -1269,6 +1589,77 @@ class Handler(BaseHTTPRequestHandler):
                 params,
             ).fetchone()
         self.send_json({"dashboard": dict(totals)})
+
+    def api_sla(self):
+        user = self.require_user()
+        if not user:
+            return
+        clause, params = self.visible_customer_clause(user)
+        now = now_ts()
+
+        def _normalize_avg(value):
+            if value is None:
+                return 0
+            return int(round(value))
+
+        with db() as conn:
+            summary = conn.execute(
+                f"""
+                select
+                    count(*) total,
+                    sum(case when c.status != 'closed' and c.first_response_at is null then 1 else 0 end) waiting_first_response,
+                    sum(
+                        case
+                            when c.status != 'closed' and c.first_response_at is null and c.sla_due_at is not null and c.sla_due_at < ?
+                            then 1
+                            else 0
+                        end
+                    ) breached_first_response,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_first_response_seconds,
+                    avg(case when c.closed_at is not null then c.closed_at - c.created_at end) avg_resolution_seconds
+                from customers c
+                where {clause}
+                """,
+                [now, *params],
+            ).fetchone()
+
+            queue_rows = conn.execute(
+                f"""
+                select
+                    q.id queue_id,
+                    q.name queue_name,
+                    count(*) total,
+                    sum(case when c.status != 'closed' and c.first_response_at is null then 1 else 0 end) waiting_first_response,
+                    sum(
+                        case
+                            when c.status != 'closed' and c.first_response_at is null and c.sla_due_at is not null and c.sla_due_at < ?
+                            then 1
+                            else 0
+                        end
+                    ) breached_first_response,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_first_response_seconds,
+                    avg(case when c.closed_at is not null then c.closed_at - c.created_at end) avg_resolution_seconds
+                from customers c
+                join queues q on q.id = c.queue_id
+                where {clause}
+                group by q.id, q.name
+                order by q.name asc
+                """,
+                [now, *params],
+            ).fetchall()
+
+        payload_summary = dict(summary)
+        payload_summary["avg_first_response_seconds"] = _normalize_avg(payload_summary["avg_first_response_seconds"])
+        payload_summary["avg_resolution_seconds"] = _normalize_avg(payload_summary["avg_resolution_seconds"])
+
+        by_queue = []
+        for row in queue_rows:
+            item = dict(row)
+            item["avg_first_response_seconds"] = _normalize_avg(item["avg_first_response_seconds"])
+            item["avg_resolution_seconds"] = _normalize_avg(item["avg_resolution_seconds"])
+            by_queue.append(item)
+
+        self.send_json({"sla": payload_summary, "by_queue": by_queue, "now": now})
 
     def api_evolution_status(self):
         user = self.require_user()

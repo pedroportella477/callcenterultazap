@@ -4,6 +4,10 @@ const state = {
   queues: [],
   operators: [],
   selectedCustomer: null,
+  sla: null,
+  realtimeSource: null,
+  realtimeRefreshTimer: null,
+  realtimeRefreshInFlight: false,
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -65,10 +69,12 @@ async function bootstrap() {
     showLogin();
     return;
   }
-  await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadCustomers(), loadEvolutionStatus()]);
+  await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadSLA(), loadCustomers(), loadEvolutionStatus()]);
+  startRealtime();
 }
 
 function showLogin() {
+  stopRealtime();
   $("#login-screen").classList.remove("hidden");
   $("#app-screen").classList.add("hidden");
 }
@@ -124,6 +130,35 @@ async function loadDashboard() {
   $("#metric-closed").textContent = dashboard.closed_total || 0;
 }
 
+function renderSLATable(byQueue) {
+  const body = $("#sla-table");
+  if (!byQueue || !byQueue.length) {
+    body.innerHTML = `<tr><td colspan="6" class="muted">Sem dados de SLA para o filtro atual.</td></tr>`;
+    return;
+  }
+  body.innerHTML = byQueue
+    .map(
+      (row) => `
+      <tr>
+        <td>${escapeHtml(row.queue_name)}</td>
+        <td>${row.total || 0}</td>
+        <td>${row.waiting_first_response || 0}</td>
+        <td>${row.breached_first_response || 0}</td>
+        <td>${row.avg_first_response_seconds || 0}</td>
+        <td>${row.avg_resolution_seconds || 0}</td>
+      </tr>`
+    )
+    .join("");
+}
+
+async function loadSLA() {
+  const payload = await api("/api/sla");
+  state.sla = payload;
+  $("#metric-sla-waiting").textContent = payload.sla.waiting_first_response || 0;
+  $("#metric-sla-breached").textContent = payload.sla.breached_first_response || 0;
+  renderSLATable(payload.by_queue || []);
+}
+
 async function loadQueues() {
   const { queues } = await api("/api/queues");
   state.queues = queues;
@@ -152,6 +187,55 @@ async function loadCustomers() {
   if (state.selectedCustomer) {
     const next = customers.find((c) => c.id === state.selectedCustomer.id);
     if (next) await selectCustomer(next.id);
+  }
+}
+
+function stopRealtime() {
+  if (state.realtimeRefreshTimer) {
+    window.clearTimeout(state.realtimeRefreshTimer);
+    state.realtimeRefreshTimer = null;
+  }
+  if (state.realtimeSource) {
+    state.realtimeSource.close();
+    state.realtimeSource = null;
+  }
+}
+
+function scheduleRealtimeRefresh() {
+  if (state.realtimeRefreshTimer) return;
+  state.realtimeRefreshTimer = window.setTimeout(async () => {
+    state.realtimeRefreshTimer = null;
+    if (state.realtimeRefreshInFlight) return;
+    state.realtimeRefreshInFlight = true;
+    try {
+      await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+      if (state.selectedCustomer) {
+        await selectCustomer(state.selectedCustomer.id);
+      }
+    } catch (error) {
+      // keep background refresh silent unless we lose auth
+      if (String(error.message || "").toLowerCase().includes("não autenticado")) {
+        stopRealtime();
+      }
+    } finally {
+      state.realtimeRefreshInFlight = false;
+    }
+  }, 250);
+}
+
+function startRealtime() {
+  stopRealtime();
+  if (!state.user) return;
+  try {
+    const source = new EventSource("/api/events");
+    source.addEventListener("ticket.updated", () => scheduleRealtimeRefresh());
+    source.addEventListener("ready", () => {});
+    source.onerror = () => {
+      // EventSource reconnects automatically; keep interface calm.
+    };
+    state.realtimeSource = source;
+  } catch (error) {
+    // Browser without SSE support: continue sem tempo real.
   }
 }
 
@@ -280,13 +364,15 @@ $("#login-form").addEventListener("submit", async (event) => {
       showLogin();
       return;
     }
-    await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadCustomers(), loadEvolutionStatus()]);
+    await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadSLA(), loadCustomers(), loadEvolutionStatus()]);
+    startRealtime();
   } catch (error) {
     toast(error.message);
   }
 });
 
 $("#logout-button").addEventListener("click", async () => {
+  stopRealtime();
   await api("/api/logout", { method: "POST" });
   state.user = null;
   showLogin();
@@ -309,7 +395,7 @@ $("#customer-form").addEventListener("submit", async (event) => {
     await api("/api/customers", { method: "POST", body: JSON.stringify(Object.fromEntries(form)) });
     $("#customer-dialog").close();
     event.currentTarget.reset();
-    await Promise.all([loadCustomers(), loadDashboard()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
     toast("Cliente criado");
   } catch (error) {
     toast(error.message);
@@ -327,7 +413,7 @@ $("#message-form").addEventListener("submit", async (event) => {
     });
     textarea.value = "";
     await selectCustomer(state.selectedCustomer.id);
-    await loadDashboard();
+    await Promise.all([loadDashboard(), loadSLA()]);
   } catch (error) {
     toast(error.message);
   }
@@ -340,7 +426,7 @@ $("#customer-status").addEventListener("change", async (event) => {
       method: "POST",
       body: JSON.stringify({ status: event.target.value }),
     });
-    await Promise.all([loadCustomers(), loadDashboard()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
   } catch (error) {
     toast(error.message);
   }
@@ -354,7 +440,7 @@ $("#assign-select").addEventListener("change", async (event) => {
       method: "POST",
       body: JSON.stringify({ operator_id: event.target.value }),
     });
-    await Promise.all([loadCustomers(), loadDashboard()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
     toast("Cliente redistribuido");
   } catch (error) {
     toast(error.message);
@@ -373,7 +459,7 @@ $("#transfer-button").addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ operator_id: operatorId }),
     });
-    await Promise.all([loadCustomers(), loadDashboard()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
     toast("Atendimento transferido");
   } catch (error) {
     toast(error.message);
@@ -387,7 +473,7 @@ $("#finalize-button").addEventListener("click", async () => {
       method: "POST",
       body: "{}",
     });
-    await Promise.all([loadCustomers(), loadDashboard()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
     toast("Atendimento finalizado e bloqueado para novas acoes");
   } catch (error) {
     toast(error.message);

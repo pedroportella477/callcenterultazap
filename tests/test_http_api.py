@@ -180,7 +180,7 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.assertEqual(code, 413)
         self.assertIn("payload", payload["error"].lower())
 
-    def test_08_login_rate_limit_returns_429(self):
+    def test_99_login_rate_limit_returns_429(self):
         for _ in range(3):
             code, payload = self.request_json("POST", "/api/login", {"email": "master", "password": "errada"})
             self.assertEqual(code, 401)
@@ -189,6 +189,37 @@ class HttpApiIntegrationTests(unittest.TestCase):
         code, payload = self.request_json("POST", "/api/login", {"email": "master", "password": "errada"})
         self.assertEqual(code, 429)
         self.assertIn("muitas tentativas", payload["error"].lower())
+
+    def test_09_sla_endpoint_returns_summary(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/sla")
+        self.assertEqual(code, 200)
+        self.assertIn("sla", payload)
+        self.assertIn("by_queue", payload)
+        self.assertIn("waiting_first_response", payload["sla"])
+        self.assertIn("breached_first_response", payload["sla"])
+
+    def test_10_create_customer_invalid_queue_returns_400(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json(
+            "POST",
+            "/api/customers",
+            {"name": "Teste", "phone": "5511999998888", "queue_id": 999999},
+        )
+        self.assertEqual(code, 400)
+        self.assertIn("fila", payload["error"].lower())
+
+    def test_11_health_contains_operational_keys(self):
+        code, payload = self.request_json("GET", "/health")
+        self.assertEqual(code, 200)
+        self.assertIn("queue_depth", payload)
+        self.assertIn("pending_webhooks", payload)
+        self.assertIn("realtime_subscribers", payload)
+
+    def test_12_events_requires_auth(self):
+        code, payload = self.request_json("GET", "/api/events")
+        self.assertEqual(code, 401)
+        self.assertIn("autenticado", payload["error"].lower())
 
 
 if __name__ == "__main__":

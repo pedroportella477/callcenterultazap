@@ -73,6 +73,8 @@
           <article><span id="metric-open">0</span><small>Abertos</small></article>
           <article><span id="metric-pending">0</span><small>Pendentes</small></article>
           <article><span id="metric-closed">0</span><small>Fechados</small></article>
+          <article><span id="metric-sla-waiting">0</span><small>Aguardando 1a resposta</small></article>
+          <article><span id="metric-sla-breached">0</span><small>SLA 1a resposta estourado</small></article>
         </section>
 
         <section id="view-inbox" class="main-grid view">
@@ -127,6 +129,21 @@
                 </tr>
               </thead>
               <tbody id="customers-table"></tbody>
+            </table>
+          </div>
+          <div class="table-panel" style="margin-top: 12px;">
+            <table>
+              <thead>
+                <tr>
+                  <th>Fila</th>
+                  <th>Total</th>
+                  <th>Aguardando 1a resposta</th>
+                  <th>SLA estourado</th>
+                  <th>Tempo medio 1a resposta (s)</th>
+                  <th>Tempo medio resolucao (s)</th>
+                </tr>
+              </thead>
+              <tbody id="sla-table"></tbody>
             </table>
           </div>
         </section>
