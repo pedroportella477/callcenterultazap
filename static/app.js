@@ -16,8 +16,20 @@ async function api(path, options = {}) {
     ...options,
   });
   if (response.status === 204) return null;
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Erro inesperado");
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    payload = null;
+  }
+  if (!response.ok) {
+    if (response.status === 429) {
+      const retryAfter = response.headers.get("Retry-After");
+      const suffix = retryAfter ? ` Tente novamente em ${retryAfter}s.` : "";
+      throw new Error((payload && payload.error) || `Muitas requisicoes.${suffix}`);
+    }
+    throw new Error((payload && payload.error) || "Erro inesperado");
+  }
   return payload;
 }
 

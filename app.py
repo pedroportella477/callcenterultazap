@@ -21,22 +21,49 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "omnichannel.sqlite3"
 STATIC_DIR = BASE_DIR / "static"
 
+def env_int(name, default, minimum=0, maximum=None):
+    raw_value = os.environ.get(name)
+    try:
+        value = int(raw_value) if raw_value is not None else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    if value < minimum:
+        value = minimum
+    if maximum is not None and value > maximum:
+        value = maximum
+    return value
+
+
 APP_SECRET = os.environ.get("APP_SECRET", "dev-secret-change-me")
 EVOLUTION_BASE_URL = os.environ.get("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "atendimento")
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
+SESSION_TTL_SECONDS = env_int("SESSION_TTL_SECONDS", 86400, minimum=300, maximum=604800)
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "0") == "1"
+MAX_JSON_BYTES = env_int("MAX_JSON_BYTES", 1048576, minimum=1024, maximum=10485760)
+MAX_WEBHOOK_QUEUE_SIZE = env_int("MAX_WEBHOOK_QUEUE_SIZE", 2000, minimum=1, maximum=100000)
+LOGIN_RATE_LIMIT_ATTEMPTS = env_int("LOGIN_RATE_LIMIT_ATTEMPTS", 8, minimum=2, maximum=100)
+LOGIN_RATE_LIMIT_WINDOW_SECONDS = env_int("LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300, minimum=30, maximum=3600)
+WEBHOOK_PROCESSED_RETENTION_SECONDS = env_int(
+    "WEBHOOK_PROCESSED_RETENTION_SECONDS", 604800, minimum=3600, maximum=31536000
+)
 
 SESSIONS = {}
+SESSIONS_LOCK = threading.RLock()
+LOGIN_ATTEMPTS = {}
+LOGIN_ATTEMPTS_LOCK = threading.Lock()
 WEBHOOK_QUEUE = deque()
 WEBHOOK_COND = threading.Condition()
 METRICS = {
     "http_requests_total": 0,
     "webhook_received_total": 0,
     "webhook_duplicate_total": 0,
+    "webhook_queue_dropped_total": 0,
     "webhook_reprocessed_total": 0,
     "webhook_failed_total": 0,
     "messages_processed_total": 0,
+    "login_rate_limited_total": 0,
 }
 
 
@@ -55,9 +82,81 @@ def json_dumps(payload):
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def prune_expired_sessions(reference_ts=None):
+    ts = reference_ts or now_ts()
+    with SESSIONS_LOCK:
+        expired_tokens = [token for token, session in SESSIONS.items() if session["expires_at"] < ts]
+        for token in expired_tokens:
+            SESSIONS.pop(token, None)
+
+
+def create_session(user_id):
+    prune_expired_sessions()
+    token = secrets.token_urlsafe(32)
+    with SESSIONS_LOCK:
+        SESSIONS[token] = {"user_id": user_id, "expires_at": now_ts() + SESSION_TTL_SECONDS}
+    return token
+
+
+def touch_session(token):
+    with SESSIONS_LOCK:
+        session = SESSIONS.get(token)
+        if not session:
+            return None
+        if session["expires_at"] < now_ts():
+            SESSIONS.pop(token, None)
+            return None
+        session["expires_at"] = now_ts() + SESSION_TTL_SECONDS
+        return dict(session)
+
+
+def session_cookie_value(token, max_age):
+    secure_flag = "; Secure" if SESSION_COOKIE_SECURE else ""
+    return f"session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}{secure_flag}"
+
+
+def _login_attempt_key(login_value, client_ip):
+    safe_login = (login_value or "<empty>").strip().lower() or "<empty>"
+    safe_ip = (client_ip or "-").strip()
+    return f"{safe_login}|{safe_ip}"
+
+
+def register_login_failure(login_value, client_ip, ts=None):
+    ref_ts = ts or now_ts()
+    key = _login_attempt_key(login_value, client_ip)
+    with LOGIN_ATTEMPTS_LOCK:
+        attempts = LOGIN_ATTEMPTS.setdefault(key, deque())
+        attempts.append(ref_ts)
+
+
+def clear_login_failures(login_value, client_ip):
+    key = _login_attempt_key(login_value, client_ip)
+    with LOGIN_ATTEMPTS_LOCK:
+        LOGIN_ATTEMPTS.pop(key, None)
+
+
+def login_rate_limit_retry_after(login_value, client_ip, ts=None):
+    ref_ts = ts or now_ts()
+    key = _login_attempt_key(login_value, client_ip)
+    with LOGIN_ATTEMPTS_LOCK:
+        attempts = LOGIN_ATTEMPTS.get(key)
+        if not attempts:
+            return 0
+        while attempts and attempts[0] <= ref_ts - LOGIN_RATE_LIMIT_WINDOW_SECONDS:
+            attempts.popleft()
+        if len(attempts) < LOGIN_RATE_LIMIT_ATTEMPTS:
+            if not attempts:
+                LOGIN_ATTEMPTS.pop(key, None)
+            return 0
+        retry_after = (attempts[0] + LOGIN_RATE_LIMIT_WINDOW_SECONDS) - ref_ts
+        return max(1, retry_after)
+
+
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("pragma foreign_keys = ON")
+    conn.execute("pragma busy_timeout = 5000")
     return conn
 
 
@@ -76,8 +175,18 @@ def verify_password(password, stored):
     return hmac.compare_digest(attempt, digest)
 
 
+def validate_password_strength(password):
+    if len(password) < 8:
+        return False, "Nova senha deve ter pelo menos 8 caracteres"
+    if not any(ch.isalpha() for ch in password) or not any(ch.isdigit() for ch in password):
+        return False, "Nova senha deve conter letras e números"
+    return True, ""
+
+
 def init_db():
     with db() as conn:
+        conn.execute("pragma journal_mode = WAL")
+        conn.execute("pragma synchronous = NORMAL")
         conn.executescript(
             """
             create table if not exists users (
@@ -145,6 +254,18 @@ def init_db():
                 created_at integer not null,
                 processed_at integer
             );
+
+            create index if not exists idx_customers_assigned_status
+            on customers(assigned_operator_id, status);
+
+            create index if not exists idx_customers_last_message
+            on customers(last_message_at desc);
+
+            create index if not exists idx_messages_customer_created
+            on messages(customer_id, created_at, id);
+
+            create index if not exists idx_webhook_events_processed
+            on webhook_events(processed, created_at);
             """
         )
 
@@ -241,6 +362,15 @@ def log_action(user_id, action, details):
         )
 
 
+def cleanup_processed_webhooks():
+    cutoff = now_ts() - WEBHOOK_PROCESSED_RETENTION_SECONDS
+    with db() as conn:
+        conn.execute(
+            "delete from webhook_events where processed = 1 and coalesce(processed_at, created_at) < ?",
+            (cutoff,),
+        )
+
+
 def parse_permissions(raw_value):
     try:
         parsed = json.loads(raw_value or "[]")
@@ -257,6 +387,10 @@ def log_structured(event, request_id, **fields):
 
 
 def metrics_payload():
+    with WEBHOOK_COND:
+        queue_depth = len(WEBHOOK_QUEUE)
+    with SESSIONS_LOCK:
+        active_sessions = len(SESSIONS)
     lines = [
         "# HELP http_requests_total Total HTTP requests.",
         "# TYPE http_requests_total counter",
@@ -267,6 +401,9 @@ def metrics_payload():
         "# HELP webhook_duplicate_total Duplicate webhook events discarded.",
         "# TYPE webhook_duplicate_total counter",
         f"webhook_duplicate_total {METRICS['webhook_duplicate_total']}",
+        "# HELP webhook_queue_dropped_total Webhook events dropped due to queue backpressure.",
+        "# TYPE webhook_queue_dropped_total counter",
+        f"webhook_queue_dropped_total {METRICS['webhook_queue_dropped_total']}",
         "# HELP webhook_reprocessed_total Webhook events reprocessed from queue.",
         "# TYPE webhook_reprocessed_total counter",
         f"webhook_reprocessed_total {METRICS['webhook_reprocessed_total']}",
@@ -276,6 +413,15 @@ def metrics_payload():
         "# HELP messages_processed_total Inbound messages processed by worker.",
         "# TYPE messages_processed_total counter",
         f"messages_processed_total {METRICS['messages_processed_total']}",
+        "# HELP login_rate_limited_total Login requests rejected by rate limiting.",
+        "# TYPE login_rate_limited_total counter",
+        f"login_rate_limited_total {METRICS['login_rate_limited_total']}",
+        "# HELP active_sessions Total active authenticated sessions.",
+        "# TYPE active_sessions gauge",
+        f"active_sessions {active_sessions}",
+        "# HELP webhook_queue_depth Current in-memory webhook queue depth.",
+        "# TYPE webhook_queue_depth gauge",
+        f"webhook_queue_depth {queue_depth}",
     ]
     return "\n".join(lines) + "\n"
 
@@ -376,6 +522,7 @@ def process_inbound_payload(payload):
 
 
 def webhook_worker():
+    processed_since_cleanup = 0
     while True:
         with WEBHOOK_COND:
             while not WEBHOOK_QUEUE:
@@ -393,6 +540,10 @@ def webhook_worker():
                 log_structured("webhook.processed", "-", event_key=event_key)
             else:
                 log_structured("webhook.ignored", "-", event_key=event_key)
+            processed_since_cleanup += 1
+            if processed_since_cleanup >= 100:
+                cleanup_processed_webhooks()
+                processed_since_cleanup = 0
         except Exception as exc:
             METRICS["webhook_failed_total"] += 1
             log_structured("webhook.failed", "-", event_key=event_key, error=str(exc))
@@ -404,11 +555,14 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
-    def send_json(self, payload, status=HTTPStatus.OK):
+    def send_json(self, payload, status=HTTPStatus.OK, extra_headers=None):
         body = json_dumps(payload)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Request-ID", self.request_id)
+        if extra_headers:
+            for key, value in extra_headers.items():
+                self.send_header(key, str(value))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -452,11 +606,21 @@ class Handler(BaseHTTPRequestHandler):
             return True, None
         return True, customer_id
 
+    def client_ip(self):
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",", 1)[0].strip()
+        return self.client_address[0]
+
     def read_json(self):
         try:
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise APIError(HTTPStatus.BAD_REQUEST, "Content-Length inválido")
+        if length < 0:
+            raise APIError(HTTPStatus.BAD_REQUEST, "Content-Length inválido")
+        if length > MAX_JSON_BYTES:
+            raise APIError(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Payload excede limite permitido")
         if length == 0:
             return {}
         raw = self.rfile.read(length).decode("utf-8")
@@ -474,15 +638,19 @@ class Handler(BaseHTTPRequestHandler):
         token = cookie.get("session")
         if not token:
             return None
-        session = SESSIONS.get(token.value)
-        if not session or session["expires_at"] < now_ts():
+        session = touch_session(token.value)
+        if not session:
             return None
         with db() as conn:
             user = conn.execute(
                 "select id, name, email, role, permissions, must_change_password, active from users where id = ? and active = 1",
                 (session["user_id"],),
             ).fetchone()
-            return dict(user) if user else None
+            if user:
+                return dict(user)
+        with SESSIONS_LOCK:
+            SESSIONS.pop(token.value, None)
+        return None
 
     def require_user(self):
         user = self.current_user()
@@ -507,15 +675,45 @@ class Handler(BaseHTTPRequestHandler):
             return "1 = 1", []
         return f"{alias}.assigned_operator_id = ?", [user["id"]]
 
+    def require_customer_access(self, user, customer_id):
+        with db() as conn:
+            row = conn.execute(
+                "select id, assigned_operator_id from customers where id = ?",
+                (customer_id,),
+            ).fetchone()
+        if not row:
+            self.send_json({"error": "Cliente não encontrado"}, HTTPStatus.NOT_FOUND)
+            return None
+        if user["role"] != "admin" and row["assigned_operator_id"] != user["id"]:
+            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+            return None
+        return dict(row)
+
     def do_GET(self):
         self.request_id = self.headers.get("X-Request-ID") or str(uuid.uuid4())
+        prune_expired_sessions()
         METRICS["http_requests_total"] += 1
         log_structured("http.request", self.request_id, method="GET", path=self.path)
         try:
             parsed = urlparse(self.path)
             path = parsed.path
             if path == "/health":
-                self.send_json({"ok": True, "ts": now_ts()})
+                with db() as conn:
+                    conn.execute("select 1").fetchone()
+                    pending_webhooks = conn.execute(
+                        "select count(*) total from webhook_events where processed = 0"
+                    ).fetchone()["total"]
+                with WEBHOOK_COND:
+                    queue_depth = len(WEBHOOK_QUEUE)
+                self.send_json(
+                    {
+                        "ok": True,
+                        "ts": now_ts(),
+                        "queue_depth": queue_depth,
+                        "pending_webhooks": pending_webhooks,
+                        "max_webhook_queue_size": MAX_WEBHOOK_QUEUE_SIZE,
+                    }
+                )
                 return
             if path == "/metrics":
                 self.send_metrics()
@@ -568,6 +766,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.request_id = self.headers.get("X-Request-ID") or str(uuid.uuid4())
+        prune_expired_sessions()
         METRICS["http_requests_total"] += 1
         log_structured("http.request", self.request_id, method="POST", path=self.path)
         try:
@@ -642,16 +841,26 @@ class Handler(BaseHTTPRequestHandler):
     def api_login(self):
         payload = self.read_json()
         login_value = (payload.get("email") or payload.get("username") or "").strip().lower()
+        retry_after = login_rate_limit_retry_after(login_value, self.client_ip())
+        if retry_after:
+            METRICS["login_rate_limited_total"] += 1
+            self.send_json(
+                {"error": "Muitas tentativas de login. Aguarde para tentar novamente."},
+                HTTPStatus.TOO_MANY_REQUESTS,
+                extra_headers={"Retry-After": retry_after},
+            )
+            return
         with db() as conn:
             user = conn.execute(
                 "select id, name, email, password_hash, role, permissions, must_change_password, active from users where lower(email) = ? or lower(name) = ?",
                 (login_value, login_value),
             ).fetchone()
         if not user or not user["active"] or not verify_password(payload.get("password", ""), user["password_hash"]):
+            register_login_failure(login_value, self.client_ip())
             self.send_json({"error": "E-mail ou senha inválidos"}, HTTPStatus.UNAUTHORIZED)
             return
-        token = secrets.token_urlsafe(32)
-        SESSIONS[token] = {"user_id": user["id"], "expires_at": now_ts() + 86400}
+        clear_login_failures(login_value, self.client_ip())
+        token = create_session(user["id"])
         body = json_dumps(
             {
                 "user": {
@@ -663,7 +872,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Request-ID", self.request_id)
-        self.send_header("Set-Cookie", f"session={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400")
+        self.send_header("Set-Cookie", session_cookie_value(token, SESSION_TTL_SECONDS))
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -672,10 +881,11 @@ class Handler(BaseHTTPRequestHandler):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
         token = cookie.get("session")
         if token:
-            SESSIONS.pop(token.value, None)
+            with SESSIONS_LOCK:
+                SESSIONS.pop(token.value, None)
         self.send_response(HTTPStatus.NO_CONTENT)
         self.send_header("X-Request-ID", self.request_id)
-        self.send_header("Set-Cookie", "session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
+        self.send_header("Set-Cookie", session_cookie_value("", 0))
         self.end_headers()
 
     def api_change_password(self):
@@ -685,8 +895,9 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json()
         old_password = payload.get("old_password", "")
         new_password = payload.get("new_password", "")
-        if len(new_password) < 8:
-            self.send_json({"error": "Nova senha deve ter pelo menos 8 caracteres"}, HTTPStatus.BAD_REQUEST)
+        valid, message = validate_password_strength(new_password)
+        if not valid:
+            self.send_json({"error": message}, HTTPStatus.BAD_REQUEST)
             return
         with db() as conn:
             row = conn.execute(
@@ -712,7 +923,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         query = parse_qs(parsed.query)
         search = f"%{query.get('q', [''])[0].strip()}%"
-        status = query.get("status", [""])[0]
+        status = query.get("status", [""])[0].strip()
+        if status and status not in {"open", "pending", "closed"}:
+            self.send_json({"error": "Filtro de status inválido"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            limit = int(query.get("limit", ["100"])[0])
+            offset = int(query.get("offset", ["0"])[0])
+        except ValueError:
+            self.send_json({"error": "Parâmetros limit/offset inválidos"}, HTTPStatus.BAD_REQUEST)
+            return
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
         clause, params = self.visible_customer_clause(user)
         filters = [clause, "(c.name like ? or c.phone like ?)"]
         params.extend([search, search])
@@ -720,6 +942,7 @@ class Handler(BaseHTTPRequestHandler):
             filters.append("c.status = ?")
             params.append(status)
         where_sql = " and ".join(filters)
+        params.extend([limit, offset])
         with db() as conn:
             rows = conn.execute(
                 f"""
@@ -729,6 +952,7 @@ class Handler(BaseHTTPRequestHandler):
                 left join users u on u.id = c.assigned_operator_id
                 where {where_sql}
                 order by coalesce(c.last_message_at, c.created_at) desc
+                limit ? offset ?
                 """,
                 params,
             ).fetchall()
@@ -738,8 +962,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         with db() as conn:
             rows = conn.execute(
@@ -752,8 +975,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
@@ -763,8 +985,14 @@ class Handler(BaseHTTPRequestHandler):
         if not text:
             self.send_json({"error": "Mensagem vazia"}, HTTPStatus.BAD_REQUEST)
             return
+        if len(text) > 4096:
+            self.send_json({"error": "Mensagem excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
         with db() as conn:
             customer = conn.execute("select * from customers where id = ?", (customer_id,)).fetchone()
+            if not customer:
+                self.send_json({"error": "Cliente nao encontrado"}, HTTPStatus.NOT_FOUND)
+                return
             external_id = None
             status = "sent"
             try:
@@ -788,14 +1016,45 @@ class Handler(BaseHTTPRequestHandler):
         payload = self.read_json()
         name = payload.get("name", "").strip()
         phone = only_digits(payload.get("phone", ""))
-        queue_id = int(payload.get("queue_id") or 0)
-        assigned_operator_id = payload.get("assigned_operator_id") or user["id"]
-        if user["role"] != "admin":
-            assigned_operator_id = user["id"]
-        if not name or not phone or not queue_id:
+        try:
+            queue_id = int(payload.get("queue_id") or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "Fila inválida"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not name or not phone or queue_id <= 0:
             self.send_json({"error": "Nome, telefone e fila são obrigatórios"}, HTTPStatus.BAD_REQUEST)
             return
+        if len(phone) < 10:
+            self.send_json({"error": "Telefone inválido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if user["role"] != "admin":
+            assigned_operator_id = user["id"]
+        else:
+            raw_operator_id = payload.get("assigned_operator_id")
+            if raw_operator_id in (None, ""):
+                assigned_operator_id = None
+            else:
+                try:
+                    assigned_operator_id = int(raw_operator_id)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "Operador inválido"}, HTTPStatus.BAD_REQUEST)
+                    return
+        if assigned_operator_id is not None and assigned_operator_id <= 0:
+            self.send_json({"error": "Operador inválido"}, HTTPStatus.BAD_REQUEST)
+            return
         with db() as conn:
+            queue = conn.execute("select id from queues where id = ?", (queue_id,)).fetchone()
+            if not queue:
+                self.send_json({"error": "Fila inválida"}, HTTPStatus.BAD_REQUEST)
+                return
+            if assigned_operator_id is not None:
+                operator = conn.execute(
+                    "select id from users where id = ? and role = 'operator' and active = 1",
+                    (assigned_operator_id,),
+                ).fetchone()
+                if not operator:
+                    self.send_json({"error": "Operador inválido"}, HTTPStatus.BAD_REQUEST)
+                    return
             try:
                 cursor = conn.execute(
                     """
@@ -818,13 +1077,22 @@ class Handler(BaseHTTPRequestHandler):
         if user["role"] != "admin":
             self.send_json({"error": "Somente admin pode redistribuir filas"}, HTTPStatus.FORBIDDEN)
             return
+        if not self.require_customer_access(user, customer_id):
+            return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
             return
         payload = self.read_json()
-        operator_id = int(payload.get("operator_id") or 0)
+        try:
+            operator_id = int(payload.get("operator_id") or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "Operador invalido"}, HTTPStatus.BAD_REQUEST)
+            return
         with db() as conn:
-            operator = conn.execute("select id from users where id = ? and role = 'operator'", (operator_id,)).fetchone()
+            operator = conn.execute(
+                "select id from users where id = ? and role = 'operator' and active = 1",
+                (operator_id,),
+            ).fetchone()
             if not operator:
                 self.send_json({"error": "Operador inválido"}, HTTPStatus.BAD_REQUEST)
                 return
@@ -836,14 +1104,13 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
             return
         payload = self.read_json()
-        status = payload.get("status")
+        status = str(payload.get("status") or "").strip().lower()
         if status not in {"open", "pending", "closed"}:
             self.send_json({"error": "Status inválido"}, HTTPStatus.BAD_REQUEST)
             return
@@ -856,14 +1123,17 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
             return
         payload = self.read_json()
-        operator_id = int(payload.get("operator_id") or 0)
+        try:
+            operator_id = int(payload.get("operator_id") or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "Operador invalido"}, HTTPStatus.BAD_REQUEST)
+            return
         with db() as conn:
             operator = conn.execute("select id from users where id = ? and role = 'operator' and active = 1", (operator_id,)).fetchone()
             if not operator:
@@ -877,8 +1147,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         with db() as conn:
             conn.execute("update customers set status = 'closed', finalized = 1 where id = ?", (customer_id,))
@@ -889,8 +1158,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         with db() as conn:
             row = conn.execute(
@@ -904,13 +1172,17 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             self.send_json({"error": "Cliente não encontrado"}, HTTPStatus.NOT_FOUND)
             return
+        try:
+            connection_data = json.loads(row["erp_connection_data"] or "{}")
+        except json.JSONDecodeError:
+            connection_data = {}
         self.send_json(
             {
                 "erp_active": bool(row["erp_provider"]),
                 "provider": row["erp_provider"],
                 "client_code": row["erp_client_code"],
                 "financial_pending": bool(row["erp_financial_pending"]),
-                "connection_data": json.loads(row["erp_connection_data"] or "{}"),
+                "connection_data": connection_data,
             }
         )
 
@@ -918,8 +1190,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
@@ -944,8 +1215,7 @@ class Handler(BaseHTTPRequestHandler):
         user = self.require_user()
         if not user:
             return
-        if not self.can_access_customer(user, customer_id):
-            self.send_json({"error": "Cliente fora da sua fila"}, HTTPStatus.FORBIDDEN)
+        if not self.require_customer_access(user, customer_id):
             return
         if self.customer_is_finalized(customer_id):
             self.send_json({"error": "Atendimento finalizado. Novas ações estão bloqueadas."}, HTTPStatus.CONFLICT)
@@ -1036,6 +1306,10 @@ class Handler(BaseHTTPRequestHandler):
         if not public_url:
             self.send_json({"error": "Informe a URL pública"}, HTTPStatus.BAD_REQUEST)
             return
+        parsed_url = urlparse(public_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            self.send_json({"error": "URL pública inválida"}, HTTPStatus.BAD_REQUEST)
+            return
         try:
             self.send_json({"response": evolution.set_webhook(public_url)})
         except RuntimeError as exc:
@@ -1050,7 +1324,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "Webhook token inválido"}, HTTPStatus.FORBIDDEN)
                 return
         data = payload.get("data", payload)
+        if not isinstance(data, dict):
+            data = {}
         key_data = data.get("key", {})
+        if not isinstance(key_data, dict):
+            key_data = {}
         event_key = str(
             key_data.get("id")
             or data.get("id")
@@ -1068,6 +1346,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "duplicate": True, "event_key": event_key})
                 return
         with WEBHOOK_COND:
+            if len(WEBHOOK_QUEUE) >= MAX_WEBHOOK_QUEUE_SIZE:
+                METRICS["webhook_queue_dropped_total"] += 1
+                log_structured("webhook.backpressure", self.request_id, event_key=event_key, queue_depth=len(WEBHOOK_QUEUE))
+                self.send_json(
+                    {"ok": False, "queued": False, "event_key": event_key, "error": "Fila de webhook lotada"},
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+                return
             WEBHOOK_QUEUE.append((event_key, payload))
             WEBHOOK_COND.notify()
         log_structured("webhook.enqueued", self.request_id, event_key=event_key)
@@ -1085,19 +1371,30 @@ class Handler(BaseHTTPRequestHandler):
                 "select event_key, payload from webhook_events where processed = 0 order by id asc limit 100"
             ).fetchall()
         count = 0
+        skipped_invalid = 0
+        skipped_backpressure = 0
         with WEBHOOK_COND:
             for row in rows:
-                WEBHOOK_QUEUE.append((row["event_key"], json.loads(row["payload"])))
+                try:
+                    parsed_payload = json.loads(row["payload"])
+                except json.JSONDecodeError:
+                    skipped_invalid += 1
+                    continue
+                if len(WEBHOOK_QUEUE) >= MAX_WEBHOOK_QUEUE_SIZE:
+                    skipped_backpressure += 1
+                    continue
+                WEBHOOK_QUEUE.append((row["event_key"], parsed_payload))
                 count += 1
             if count:
                 WEBHOOK_COND.notify_all()
-        self.send_json({"ok": True, "requeued": count})
-
-    def can_access_customer(self, user, customer_id):
-        clause, params = self.visible_customer_clause(user)
-        with db() as conn:
-            row = conn.execute(f"select id from customers c where c.id = ? and {clause}", [customer_id, *params]).fetchone()
-        return bool(row)
+        self.send_json(
+            {
+                "ok": True,
+                "requeued": count,
+                "skipped_invalid": skipped_invalid,
+                "skipped_backpressure": skipped_backpressure,
+            }
+        )
 
     def customer_is_finalized(self, customer_id):
         with db() as conn:
@@ -1107,8 +1404,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def customer_payload(row):
     payload = dict(row)
-    payload["tags"] = json.loads(payload.get("tags") or "[]")
-    payload["erp_connection_data"] = json.loads(payload.get("erp_connection_data") or "{}")
+    try:
+        payload["tags"] = json.loads(payload.get("tags") or "[]")
+    except json.JSONDecodeError:
+        payload["tags"] = []
+    try:
+        payload["erp_connection_data"] = json.loads(payload.get("erp_connection_data") or "{}")
+    except json.JSONDecodeError:
+        payload["erp_connection_data"] = {}
     return payload
 
 
@@ -1123,7 +1426,12 @@ def main():
     port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Omnichannel rodando em http://127.0.0.1:{port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
 
 
 if __name__ == "__main__":

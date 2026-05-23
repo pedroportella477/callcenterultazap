@@ -65,12 +65,16 @@ Recomendacao: altere a senha padrao apos o primeiro login.
 - Validacao por token opcional via header `X-Webhook-Token` com `WEBHOOK_TOKEN`.
 - Idempotencia por `event_key` persistida em SQLite (`webhook_events`).
 - Fila em memoria + worker para processamento assinc.
+- Backpressure de webhook com limite de fila e resposta `503` quando saturada.
+- Limpeza automatica de eventos antigos ja processados.
 - Reprocessamento de pendentes: `POST /api/webhook/reprocess` (admin).
 - Logs estruturados JSON por request e por evento.
 - Tracing simples por `X-Request-ID`.
 - Metricas Prometheus em `/metrics`.
 - Healthcheck em `/health`.
 - Troca de senha obrigatoria para credencial padrao em `POST /api/change-password`.
+- Rate limit de tentativas de login (retorno `429` com `Retry-After`).
+- Limite de payload JSON para reduzir risco de abuso (`413`).
 
 ## Integracao completa com ERPs
 
@@ -123,3 +127,10 @@ Variaveis de ambiente uteis:
 - `EVOLUTION_BASE_URL`
 - `EVOLUTION_API_KEY`
 - `EVOLUTION_INSTANCE`
+- `SESSION_TTL_SECONDS`: duracao da sessao autenticada (default `86400`)
+- `SESSION_COOKIE_SECURE`: define cookie `Secure` (`1` para habilitar)
+- `MAX_JSON_BYTES`: limite de payload JSON por requisicao (default `1048576`)
+- `MAX_WEBHOOK_QUEUE_SIZE`: limite da fila em memoria do worker webhook (default `2000`)
+- `LOGIN_RATE_LIMIT_ATTEMPTS`: numero maximo de tentativas de login por janela (default `8`)
+- `LOGIN_RATE_LIMIT_WINDOW_SECONDS`: janela de rate limit do login em segundos (default `300`)
+- `WEBHOOK_PROCESSED_RETENTION_SECONDS`: retencao de eventos processados em segundos (default `604800`)

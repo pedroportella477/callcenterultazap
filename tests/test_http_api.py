@@ -28,6 +28,9 @@ class HttpApiIntegrationTests(unittest.TestCase):
         cls.port = cls._free_port()
         env = os.environ.copy()
         env["PORT"] = str(cls.port)
+        env["LOGIN_RATE_LIMIT_ATTEMPTS"] = "3"
+        env["LOGIN_RATE_LIMIT_WINDOW_SECONDS"] = "120"
+        env["MAX_JSON_BYTES"] = "65536"
         cls.proc = subprocess.Popen(
             [sys.executable, "app.py"],
             cwd=str(tmp_path),
@@ -157,6 +160,35 @@ class HttpApiIntegrationTests(unittest.TestCase):
         code, payload = self.request_json("POST", f"/api/customers/{customer_id}/unlock-billing", {})
         self.assertEqual(code, 409)
         self.assertIn("finalizado", payload["error"])
+
+    def test_05_invalid_status_filter_returns_400(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers?status=invalid")
+        self.assertEqual(code, 400)
+        self.assertIn("status", payload["error"].lower())
+
+    def test_06_non_existing_customer_returns_404(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers/999999/messages")
+        self.assertEqual(code, 404)
+        self.assertIn("cliente", payload["error"].lower())
+
+    def test_07_payload_too_large_returns_413(self):
+        oversized_password = "x" * 70000
+        raw = json.dumps({"email": "master", "password": oversized_password})
+        code, payload = self.request_json("POST", "/api/login", raw_body=raw)
+        self.assertEqual(code, 413)
+        self.assertIn("payload", payload["error"].lower())
+
+    def test_08_login_rate_limit_returns_429(self):
+        for _ in range(3):
+            code, payload = self.request_json("POST", "/api/login", {"email": "master", "password": "errada"})
+            self.assertEqual(code, 401)
+            self.assertIn("senha", payload["error"].lower())
+
+        code, payload = self.request_json("POST", "/api/login", {"email": "master", "password": "errada"})
+        self.assertEqual(code, 429)
+        self.assertIn("muitas tentativas", payload["error"].lower())
 
 
 if __name__ == "__main__":
