@@ -446,6 +446,32 @@ th {
   justify-content: flex-end;
 }
 
+.intelligence-list {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 8px;
+}
+
+.intelligence-list li {
+  color: #334155;
+}
+
+.alert-critical {
+  color: #b42318;
+  font-weight: 700;
+}
+
+.alert-warning {
+  color: #b45309;
+  font-weight: 700;
+}
+
+.alert-info {
+  color: #0f766e;
+  font-weight: 700;
+}
+
 dialog {
   width: min(520px, calc(100vw - 32px));
   border: 1px solid var(--line);

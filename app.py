@@ -1016,6 +1016,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/sla":
                 self.api_sla()
                 return
+            if path == "/api/dashboard/intelligence":
+                self.api_dashboard_intelligence()
+                return
             if path == "/api/evolution/status":
                 self.api_evolution_status()
                 return
@@ -1660,6 +1663,156 @@ class Handler(BaseHTTPRequestHandler):
             by_queue.append(item)
 
         self.send_json({"sla": payload_summary, "by_queue": by_queue, "now": now})
+
+    def api_dashboard_intelligence(self):
+        user = self.require_user()
+        if not user:
+            return
+        clause, params = self.visible_customer_clause(user)
+        now = now_ts()
+
+        with db() as conn:
+            base = conn.execute(
+                f"""
+                select
+                    sum(case when c.status != 'closed' then 1 else 0 end) active_tickets,
+                    sum(case when c.status != 'closed' and c.assigned_operator_id is null then 1 else 0 end) unassigned_active,
+                    sum(
+                        case
+                            when c.status != 'closed' and c.first_response_at is null and c.sla_due_at is not null and c.sla_due_at < ?
+                            then 1
+                            else 0
+                        end
+                    ) overdue_first_response,
+                    avg(case when c.status != 'closed' then ? - c.created_at end) avg_active_age_seconds
+                from customers c
+                where {clause}
+                """,
+                [now, now, *params],
+            ).fetchone()
+
+            queue_rows = conn.execute(
+                f"""
+                select
+                    q.name queue_name,
+                    sum(case when c.status != 'closed' then 1 else 0 end) active_tickets,
+                    sum(case when c.status != 'closed' and c.first_response_at is null then 1 else 0 end) waiting_first_response,
+                    sum(
+                        case
+                            when c.status != 'closed' and c.first_response_at is null and c.sla_due_at is not null and c.sla_due_at < ?
+                            then 1
+                            else 0
+                        end
+                    ) overdue_first_response
+                from customers c
+                join queues q on q.id = c.queue_id
+                where {clause}
+                group by q.id, q.name
+                order by q.name asc
+                """,
+                [now, *params],
+            ).fetchall()
+
+            operator_rows = conn.execute(
+                f"""
+                select
+                    coalesce(u.name, 'Sem operador') operator_name,
+                    sum(case when c.status != 'closed' then 1 else 0 end) active_tickets,
+                    sum(case when c.status = 'closed' then 1 else 0 end) closed_tickets,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_first_response_seconds
+                from customers c
+                left join users u on u.id = c.assigned_operator_id
+                where {clause}
+                group by u.id, u.name
+                order by active_tickets desc, operator_name asc
+                """,
+                params,
+            ).fetchall()
+
+        active_tickets = int(base["active_tickets"] or 0)
+        unassigned_active = int(base["unassigned_active"] or 0)
+        overdue = int(base["overdue_first_response"] or 0)
+        avg_age_seconds = int(round(base["avg_active_age_seconds"] or 0))
+
+        alerts = []
+        if overdue > 0:
+            alerts.append(
+                {
+                    "level": "critical",
+                    "title": "SLA de primeira resposta estourado",
+                    "detail": f"{overdue} ticket(s) acima do SLA inicial.",
+                }
+            )
+        if unassigned_active > 0:
+            alerts.append(
+                {
+                    "level": "warning",
+                    "title": "Tickets sem operador",
+                    "detail": f"{unassigned_active} ticket(s) ativos sem responsável.",
+                }
+            )
+        if active_tickets > 0 and avg_age_seconds > 7200:
+            alerts.append(
+                {
+                    "level": "warning",
+                    "title": "Backlog envelhecido",
+                    "detail": f"Tempo médio dos tickets ativos em {avg_age_seconds}s.",
+                }
+            )
+        if not alerts:
+            alerts.append(
+                {
+                    "level": "info",
+                    "title": "Operação estável",
+                    "detail": "Nenhum alerta crítico no momento.",
+                }
+            )
+
+        queue_health = []
+        for row in queue_rows:
+            item = dict(row)
+            score = (item["overdue_first_response"] or 0) * 3 + (item["waiting_first_response"] or 0)
+            item["pressure_score"] = int(score)
+            queue_health.append(item)
+        queue_health.sort(key=lambda x: x["pressure_score"], reverse=True)
+
+        operators = []
+        for row in operator_rows:
+            item = dict(row)
+            item["avg_first_response_seconds"] = int(round(item["avg_first_response_seconds"] or 0))
+            operators.append(item)
+
+        health_score = 100
+        health_score -= min(overdue * 12, 60)
+        health_score -= min(unassigned_active * 6, 24)
+        if avg_age_seconds > 7200:
+            health_score -= 10
+        health_score = max(0, min(100, health_score))
+
+        recommendations = []
+        if overdue > 0:
+            recommendations.append("Priorizar imediatamente tickets com SLA estourado.")
+        if unassigned_active > 0:
+            recommendations.append("Distribuir tickets sem operador para balancear carga.")
+        if queue_health and queue_health[0]["pressure_score"] >= 3:
+            recommendations.append(f"Reforçar a fila {queue_health[0]['queue_name']} nas próximas horas.")
+        if not recommendations:
+            recommendations.append("Manter monitoramento contínuo e revisar metas de SLA semanalmente.")
+
+        self.send_json(
+            {
+                "score": health_score,
+                "active_tickets": active_tickets,
+                "unassigned_active": unassigned_active,
+                "overdue_first_response": overdue,
+                "avg_active_age_seconds": avg_age_seconds,
+                "alerts": alerts,
+                "queue_health": queue_health,
+                "operators": operators,
+                "recommendations": recommendations,
+                "generated_at": now,
+            }
+        )
 
     def api_evolution_status(self):
         user = self.require_user()

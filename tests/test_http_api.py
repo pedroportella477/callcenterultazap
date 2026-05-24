@@ -221,6 +221,16 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.assertEqual(code, 401)
         self.assertIn("autenticado", payload["error"].lower())
 
+    def test_13_intelligence_endpoint_returns_managed_payload(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/dashboard/intelligence")
+        self.assertEqual(code, 200)
+        self.assertIn("score", payload)
+        self.assertIn("alerts", payload)
+        self.assertIn("queue_health", payload)
+        self.assertIn("operators", payload)
+        self.assertIn("recommendations", payload)
+
 
 if __name__ == "__main__":
     unittest.main()

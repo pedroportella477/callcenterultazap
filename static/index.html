@@ -146,6 +146,49 @@
               <tbody id="sla-table"></tbody>
             </table>
           </div>
+          <div class="settings-grid" style="margin-top: 12px;">
+            <article class="settings-panel">
+              <h3>Inteligencia operacional</h3>
+              <div class="config-list">
+                <dt>Score</dt><dd id="intel-score">0</dd>
+                <dt>Tickets ativos</dt><dd id="intel-active">0</dd>
+                <dt>Sem operador</dt><dd id="intel-unassigned">0</dd>
+                <dt>SLA estourado</dt><dd id="intel-overdue">0</dd>
+                <dt>Idade media</dt><dd id="intel-age">0s</dd>
+              </div>
+              <h4>Alertas</h4>
+              <ul id="intel-alerts" class="intelligence-list"></ul>
+              <h4>Recomendacoes</h4>
+              <ul id="intel-recommendations" class="intelligence-list"></ul>
+            </article>
+            <article class="settings-panel">
+              <h3>Carga por operador</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Operador</th>
+                    <th>Ativos</th>
+                    <th>Fechados</th>
+                    <th>1a resposta media (s)</th>
+                  </tr>
+                </thead>
+                <tbody id="intel-operators"></tbody>
+              </table>
+              <h3 style="margin-top: 16px;">Pressao por fila</h3>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fila</th>
+                    <th>Ativos</th>
+                    <th>Aguardando</th>
+                    <th>SLA estourado</th>
+                    <th>Score de pressao</th>
+                  </tr>
+                </thead>
+                <tbody id="intel-queues"></tbody>
+              </table>
+            </article>
+          </div>
         </section>
 
         <section id="view-settings" class="view hidden">

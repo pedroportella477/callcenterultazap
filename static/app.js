@@ -5,6 +5,7 @@ const state = {
   operators: [],
   selectedCustomer: null,
   sla: null,
+  intelligence: null,
   realtimeSource: null,
   realtimeRefreshTimer: null,
   realtimeRefreshInFlight: false,
@@ -69,7 +70,15 @@ async function bootstrap() {
     showLogin();
     return;
   }
-  await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadSLA(), loadCustomers(), loadEvolutionStatus()]);
+  await Promise.all([
+    loadQueues(),
+    loadOperators(),
+    loadDashboard(),
+    loadSLA(),
+    loadIntelligence(),
+    loadCustomers(),
+    loadEvolutionStatus(),
+  ]);
   startRealtime();
 }
 
@@ -159,6 +168,67 @@ async function loadSLA() {
   renderSLATable(payload.by_queue || []);
 }
 
+function renderIntelligence(payload) {
+  $("#intel-score").textContent = payload.score || 0;
+  $("#intel-active").textContent = payload.active_tickets || 0;
+  $("#intel-unassigned").textContent = payload.unassigned_active || 0;
+  $("#intel-overdue").textContent = payload.overdue_first_response || 0;
+  $("#intel-age").textContent = `${payload.avg_active_age_seconds || 0}s`;
+
+  const alerts = payload.alerts || [];
+  $("#intel-alerts").innerHTML = alerts
+    .map(
+      (alert) => `
+      <li>
+        <span class="alert-${escapeHtml(alert.level || "info")}">${escapeHtml(alert.title || "Alerta")}</span>:
+        ${escapeHtml(alert.detail || "")}
+      </li>`
+    )
+    .join("");
+
+  const recommendations = payload.recommendations || [];
+  $("#intel-recommendations").innerHTML = recommendations
+    .map((item) => `<li>${escapeHtml(item)}</li>`)
+    .join("");
+
+  const operators = payload.operators || [];
+  $("#intel-operators").innerHTML = operators.length
+    ? operators
+        .map(
+          (row) => `
+          <tr>
+            <td>${escapeHtml(row.operator_name)}</td>
+            <td>${row.active_tickets || 0}</td>
+            <td>${row.closed_tickets || 0}</td>
+            <td>${row.avg_first_response_seconds || 0}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="4" class="muted">Sem dados para o escopo atual.</td></tr>`;
+
+  const queues = payload.queue_health || [];
+  $("#intel-queues").innerHTML = queues.length
+    ? queues
+        .map(
+          (row) => `
+          <tr>
+            <td>${escapeHtml(row.queue_name)}</td>
+            <td>${row.active_tickets || 0}</td>
+            <td>${row.waiting_first_response || 0}</td>
+            <td>${row.overdue_first_response || 0}</td>
+            <td>${row.pressure_score || 0}</td>
+          </tr>`
+        )
+        .join("")
+    : `<tr><td colspan="5" class="muted">Sem dados para o escopo atual.</td></tr>`;
+}
+
+async function loadIntelligence() {
+  const payload = await api("/api/dashboard/intelligence");
+  state.intelligence = payload;
+  renderIntelligence(payload);
+}
+
 async function loadQueues() {
   const { queues } = await api("/api/queues");
   state.queues = queues;
@@ -208,7 +278,7 @@ function scheduleRealtimeRefresh() {
     if (state.realtimeRefreshInFlight) return;
     state.realtimeRefreshInFlight = true;
     try {
-      await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+      await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
       if (state.selectedCustomer) {
         await selectCustomer(state.selectedCustomer.id);
       }
@@ -364,7 +434,15 @@ $("#login-form").addEventListener("submit", async (event) => {
       showLogin();
       return;
     }
-    await Promise.all([loadQueues(), loadOperators(), loadDashboard(), loadSLA(), loadCustomers(), loadEvolutionStatus()]);
+    await Promise.all([
+      loadQueues(),
+      loadOperators(),
+      loadDashboard(),
+      loadSLA(),
+      loadIntelligence(),
+      loadCustomers(),
+      loadEvolutionStatus(),
+    ]);
     startRealtime();
   } catch (error) {
     toast(error.message);
@@ -395,7 +473,7 @@ $("#customer-form").addEventListener("submit", async (event) => {
     await api("/api/customers", { method: "POST", body: JSON.stringify(Object.fromEntries(form)) });
     $("#customer-dialog").close();
     event.currentTarget.reset();
-    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
     toast("Cliente criado");
   } catch (error) {
     toast(error.message);
@@ -413,7 +491,7 @@ $("#message-form").addEventListener("submit", async (event) => {
     });
     textarea.value = "";
     await selectCustomer(state.selectedCustomer.id);
-    await Promise.all([loadDashboard(), loadSLA()]);
+    await Promise.all([loadDashboard(), loadSLA(), loadIntelligence()]);
   } catch (error) {
     toast(error.message);
   }
@@ -426,7 +504,7 @@ $("#customer-status").addEventListener("change", async (event) => {
       method: "POST",
       body: JSON.stringify({ status: event.target.value }),
     });
-    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
   } catch (error) {
     toast(error.message);
   }
@@ -440,7 +518,7 @@ $("#assign-select").addEventListener("change", async (event) => {
       method: "POST",
       body: JSON.stringify({ operator_id: event.target.value }),
     });
-    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
     toast("Cliente redistribuido");
   } catch (error) {
     toast(error.message);
@@ -459,7 +537,7 @@ $("#transfer-button").addEventListener("click", async () => {
       method: "POST",
       body: JSON.stringify({ operator_id: operatorId }),
     });
-    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
     toast("Atendimento transferido");
   } catch (error) {
     toast(error.message);
@@ -473,7 +551,7 @@ $("#finalize-button").addEventListener("click", async () => {
       method: "POST",
       body: "{}",
     });
-    await Promise.all([loadCustomers(), loadDashboard(), loadSLA()]);
+    await Promise.all([loadCustomers(), loadDashboard(), loadSLA(), loadIntelligence()]);
     toast("Atendimento finalizado e bloqueado para novas acoes");
   } catch (error) {
     toast(error.message);

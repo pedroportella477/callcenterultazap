@@ -77,6 +77,7 @@ Recomendacao: altere a senha padrao apos o primeiro login.
 - Limite de payload JSON para reduzir risco de abuso (`413`).
 - Atualizacao em tempo real via SSE em `GET /api/events`.
 - SLA operacional em `GET /api/sla` (resumo + visao por fila).
+- Dashboard inteligente em `GET /api/dashboard/intelligence` (score, alertas, carga por fila e operadores).
 
 ## Integracao completa com ERPs
 
