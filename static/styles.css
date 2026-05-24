@@ -219,7 +219,7 @@ nav {
 
 .metrics {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   margin: 22px 0;
 }
@@ -371,11 +371,57 @@ nav {
   padding: 14px;
 }
 
+.composer-tools {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
 .erp-panel {
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   background: #f8fafc;
   padding: 12px 14px;
+}
+
+.chat-ops {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+  padding: 12px 14px;
+}
+
+.chat-ops article {
+  min-width: 0;
+}
+
+.chat-ops h4 {
+  margin: 0 0 8px;
+  font-size: 0.95rem;
+}
+
+.private-notes-list {
+  display: grid;
+  gap: 8px;
+  max-height: 150px;
+  overflow: auto;
+  margin-bottom: 10px;
+}
+
+.private-note-item {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: white;
+  padding: 8px;
+}
+
+.private-note-item small {
+  display: block;
+  color: var(--muted);
+  margin-bottom: 4px;
 }
 
 .erp-connection {
@@ -392,6 +438,31 @@ nav {
 
 .table-panel {
   overflow: auto;
+}
+
+.panel-toolbar {
+  display: flex;
+  gap: 10px;
+  align-items: end;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+  padding: 12px 14px;
+}
+
+.panel-toolbar label {
+  min-width: 150px;
+}
+
+.target-cell {
+  min-width: 120px;
+}
+
+.target-cell input[type="number"] {
+  min-width: 90px;
+}
+
+.target-cell input[type="checkbox"] {
+  width: auto;
 }
 
 table {
@@ -513,6 +584,10 @@ dialog::backdrop {
     grid-template-columns: 1fr;
   }
 
+  .chat-ops {
+    grid-template-columns: 1fr;
+  }
+
   .topbar {
     align-items: stretch;
     flex-direction: column;
@@ -535,6 +610,10 @@ dialog::backdrop {
   }
 
   .composer {
+    grid-template-columns: 1fr;
+  }
+
+  .composer-tools {
     grid-template-columns: 1fr;
   }
 }

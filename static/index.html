@@ -75,6 +75,10 @@
           <article><span id="metric-closed">0</span><small>Fechados</small></article>
           <article><span id="metric-sla-waiting">0</span><small>Aguardando 1a resposta</small></article>
           <article><span id="metric-sla-breached">0</span><small>SLA 1a resposta estourado</small></article>
+          <article><span id="metric-tme-average">0s</span><small>TME medio</small></article>
+          <article><span id="metric-tma-average">0s</span><small>TMA medio</small></article>
+          <article><span id="metric-tme-compliance">0%</span><small>Conformidade TME</small></article>
+          <article><span id="metric-tma-compliance">0%</span><small>Conformidade TMA</small></article>
         </section>
 
         <section id="view-inbox" class="main-grid view">
@@ -102,13 +106,105 @@
                 <p><strong>Painel ERP</strong></p>
                 <p id="erp-summary" class="muted">Sem dados ERP.</p>
                 <pre id="erp-connection" class="erp-connection"></pre>
+                <label class="admin-only hidden">
+                  <input id="campaign-opt-out-checkbox" type="checkbox">
+                  Opt-out de campanhas
+                </label>
                 <div class="button-row">
                   <button id="send-boleto-button" type="button">Enviar boleto</button>
                   <button id="unlock-billing-button" type="button">Desbloquear cobranca</button>
                 </div>
               </section>
+              <section class="chat-ops">
+                <article>
+                  <h4>Notas privadas</h4>
+                  <div id="private-notes-list" class="private-notes-list"></div>
+                  <form id="private-note-form" class="form-grid">
+                    <label>
+                      Nova nota
+                      <textarea name="body" rows="2" maxlength="4096" required></textarea>
+                    </label>
+                    <div class="button-row">
+                      <button type="submit">Salvar nota</button>
+                    </div>
+                  </form>
+                </article>
+                <article>
+                  <h4>Agendamento</h4>
+                  <form id="schedule-message-form" class="form-grid">
+                    <label>
+                      Data e hora
+                      <input name="send_at" type="datetime-local" required>
+                    </label>
+                    <label>
+                      Mensagem
+                      <textarea name="body" rows="2" maxlength="4096" required></textarea>
+                    </label>
+                    <div class="button-row">
+                      <button type="submit">Agendar</button>
+                    </div>
+                  </form>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Quando</th>
+                        <th>Status</th>
+                        <th>Acao</th>
+                      </tr>
+                    </thead>
+                    <tbody id="scheduled-messages-table"></tbody>
+                  </table>
+                  <h4 style="margin-top: 12px;">Midias</h4>
+                  <form id="media-form" class="form-grid">
+                    <label>
+                      Tipo
+                      <select name="media_type" required>
+                        <option value="image">Imagem</option>
+                        <option value="video">Video</option>
+                        <option value="gif">GIF</option>
+                        <option value="sticker">Sticker</option>
+                        <option value="file">Arquivo</option>
+                      </select>
+                    </label>
+                    <label>
+                      URL
+                      <input name="url" type="url" maxlength="2048">
+                    </label>
+                    <label>
+                      Arquivo
+                      <input name="file" type="file" accept="image/*,video/*,.gif,.pdf,.txt,.mp4,.webm,.ogg,.webp,.png,.jpg,.jpeg">
+                    </label>
+                    <label>
+                      Legenda
+                      <input name="caption" maxlength="1024">
+                    </label>
+                    <div class="button-row">
+                      <button type="submit">Enviar midia</button>
+                    </div>
+                  </form>
+                  <h4 style="margin-top: 12px;">Sugestao IA</h4>
+                  <div class="button-row" style="justify-content: flex-start;">
+                    <button id="ai-suggest-button" type="button">Gerar sugestao</button>
+                  </div>
+                  <textarea id="ai-suggest-output" rows="3" readonly placeholder="A sugestao de resposta aparecera aqui."></textarea>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Tipo</th>
+                        <th>URL</th>
+                        <th>Data</th>
+                      </tr>
+                    </thead>
+                    <tbody id="media-table"></tbody>
+                  </table>
+                </article>
+              </section>
               <div id="message-list" class="message-list"></div>
               <form id="message-form" class="composer">
+                <div class="composer-tools">
+                  <select id="quick-reply-select"></select>
+                  <button id="quick-reply-send-button" type="button">Frase rapida</button>
+                </div>
                 <textarea name="body" placeholder="Digite a resposta" rows="2" required></textarea>
                 <button type="submit">Enviar</button>
               </form>
@@ -144,6 +240,49 @@
                 </tr>
               </thead>
               <tbody id="sla-table"></tbody>
+            </table>
+          </div>
+          <div class="table-panel" style="margin-top: 12px;">
+            <div class="panel-toolbar">
+              <strong>Gerenciamento TMA/TME</strong>
+              <label>
+                Janela
+                <select id="tma-tme-window">
+                  <option value="1">Hoje</option>
+                  <option value="7">7 dias</option>
+                  <option value="30" selected>30 dias</option>
+                  <option value="60">60 dias</option>
+                  <option value="90">90 dias</option>
+                </select>
+              </label>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Fila</th>
+                  <th>Total</th>
+                  <th>TME medio (s)</th>
+                  <th>Meta TME (s)</th>
+                  <th>Conformidade TME (%)</th>
+                  <th>TMA medio (s)</th>
+                  <th>Meta TMA (s)</th>
+                  <th>Conformidade TMA (%)</th>
+                </tr>
+              </thead>
+              <tbody id="tma-tme-queues"></tbody>
+            </table>
+            <table style="margin-top: 12px;">
+              <thead>
+                <tr>
+                  <th>Operador</th>
+                  <th>Total</th>
+                  <th>Respondidos</th>
+                  <th>Finalizados</th>
+                  <th>TME medio (s)</th>
+                  <th>TMA medio (s)</th>
+                </tr>
+              </thead>
+              <tbody id="tma-tme-operators"></tbody>
             </table>
           </div>
           <div class="settings-grid" style="margin-top: 12px;">
@@ -189,6 +328,35 @@
               </table>
             </article>
           </div>
+          <div class="table-panel admin-only hidden" style="margin-top: 12px; padding: 16px;">
+            <h3 style="margin-top: 0;">Metas TMA/TME por fila</h3>
+            <form id="tma-tme-targets-form" class="form-grid">
+              <div class="settings-grid">
+                <label>
+                  Meta TME global (segundos)
+                  <input id="target-global-tme" type="number" min="30" max="86400" required>
+                </label>
+                <label>
+                  Meta TMA global (segundos)
+                  <input id="target-global-tma" type="number" min="60" max="172800" required>
+                </label>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Fila</th>
+                    <th>Meta TME (s)</th>
+                    <th>Meta TMA (s)</th>
+                    <th>Usar global</th>
+                  </tr>
+                </thead>
+                <tbody id="tma-tme-targets-queues"></tbody>
+              </table>
+              <div class="button-row">
+                <button type="submit">Salvar metas</button>
+              </div>
+            </form>
+          </div>
         </section>
 
         <section id="view-settings" class="view hidden">
@@ -214,6 +382,88 @@
                 </label>
                 <button type="submit">Configurar webhook</button>
               </form>
+            </article>
+            <article class="settings-panel admin-only hidden">
+              <h3>Frases rapidas</h3>
+              <form id="quick-reply-form" class="form-grid">
+                <label>
+                  Atalho
+                  <input name="shortcut" placeholder="/saudacao" maxlength="64" required>
+                </label>
+                <label>
+                  Texto
+                  <textarea name="body" rows="3" maxlength="4096" required></textarea>
+                </label>
+                <div class="button-row">
+                  <button type="submit">Salvar frase</button>
+                </div>
+              </form>
+              <table style="margin-top: 12px;">
+                <thead>
+                  <tr>
+                    <th>Atalho</th>
+                    <th>Texto</th>
+                    <th>Atualizado</th>
+                  </tr>
+                </thead>
+                <tbody id="quick-replies-table"></tbody>
+              </table>
+            </article>
+            <article class="settings-panel">
+              <h3>Chat da equipe</h3>
+              <div id="team-messages-list" class="private-notes-list"></div>
+              <form id="team-message-form" class="form-grid">
+                <label>
+                  Nova mensagem interna
+                  <textarea name="body" rows="3" maxlength="4096" required></textarea>
+                </label>
+                <div class="button-row">
+                  <button type="submit">Enviar no chat interno</button>
+                </div>
+              </form>
+            </article>
+            <article class="settings-panel admin-only hidden">
+              <h3>Campanhas</h3>
+              <form id="campaign-form" class="form-grid">
+                <label>
+                  Nome da campanha
+                  <input name="name" maxlength="120" required>
+                </label>
+                <label>
+                  Mensagem
+                  <textarea name="body" rows="3" maxlength="4096" required></textarea>
+                </label>
+                <label>
+                  Agendar para
+                  <input name="scheduled_at" type="datetime-local">
+                </label>
+                <label>
+                  Taxa por minuto
+                  <input name="rate_per_minute" type="number" min="1" max="600" value="120" required>
+                </label>
+                <label>
+                  Clientes da campanha
+                  <select id="campaign-customers" name="customer_ids" multiple size="8" required></select>
+                </label>
+                <div class="button-row">
+                  <button type="submit">Disparar campanha</button>
+                </div>
+              </form>
+              <table style="margin-top: 12px;">
+                <thead>
+                  <tr>
+                    <th>Nome</th>
+                    <th>Status</th>
+                    <th>Total</th>
+                    <th>Fila</th>
+                    <th>Enviados</th>
+                    <th>Falhas</th>
+                    <th>Agenda</th>
+                    <th>Exportar</th>
+                  </tr>
+                </thead>
+                <tbody id="campaigns-table"></tbody>
+              </table>
             </article>
           </div>
         </section>

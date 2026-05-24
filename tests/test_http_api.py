@@ -1,6 +1,7 @@
 import http.cookiejar
 import json
 import os
+import base64
 import shutil
 import socket
 import subprocess
@@ -98,8 +99,23 @@ class HttpApiIntegrationTests(unittest.TestCase):
             parsed = json.loads(text) if text else None
             return exc.code, parsed
 
+    def request_raw(self, method, path, payload=None):
+        headers = {"Content-Type": "application/json"}
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(f"{self.base_url}{path}", data=data, method=method, headers=headers)
+        try:
+            with self.opener.open(req, timeout=3) as response:
+                return response.getcode(), response.read(), response.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), exc.headers
+
     def login_master(self, password):
         return self.request_json("POST", "/api/login", {"email": "master", "password": password})
+
+    def login_user(self, login, password):
+        return self.request_json("POST", "/api/login", {"email": login, "password": password})
 
     def ensure_logged_in_master(self):
         code, payload = self.login_master(self.MASTER_NEW_PASSWORD)
@@ -147,7 +163,8 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.ensure_logged_in_master()
         code, payload = self.request_json("GET", "/api/customers")
         self.assertEqual(code, 200)
-        customer_id = payload["customers"][0]["id"]
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
 
         code, payload = self.request_json("POST", f"/api/customers/{customer_id}/finalize", {})
         self.assertEqual(code, 200)
@@ -230,6 +247,319 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.assertIn("queue_health", payload)
         self.assertIn("operators", payload)
         self.assertIn("recommendations", payload)
+
+    def test_14_tma_tme_endpoint_returns_summary(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/tma-tme?days=30")
+        self.assertEqual(code, 200)
+        self.assertIn("summary", payload)
+        self.assertIn("by_queue", payload)
+        self.assertIn("by_operator", payload)
+        self.assertIn("targets", payload)
+        self.assertIn("avg_tme_seconds", payload["summary"])
+        self.assertIn("avg_tma_seconds", payload["summary"])
+        self.assertIn("tme_compliance_percent", payload["summary"])
+        self.assertIn("tma_compliance_percent", payload["summary"])
+
+    def test_15_tma_tme_targets_update_requires_admin(self):
+        code, payload = self.login_user("ana@local", "operador123")
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["user"]["role"], "operator")
+        code, payload = self.request_json(
+            "POST",
+            "/api/tma-tme/targets",
+            {"global": {"tme_target_seconds": 200, "tma_target_seconds": 800}},
+        )
+        self.assertEqual(code, 403)
+        self.assertIn("admin", payload["error"].lower())
+
+    def test_16_tma_tme_targets_update_and_read(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/queues")
+        self.assertEqual(code, 200)
+        queue_id = payload["queues"][0]["id"]
+
+        code, payload = self.request_json(
+            "POST",
+            "/api/tma-tme/targets",
+            {
+                "global": {"tme_target_seconds": 240, "tma_target_seconds": 900},
+                "queues": [
+                    {
+                        "queue_id": queue_id,
+                        "tme_target_seconds": 180,
+                        "tma_target_seconds": 720,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", "/api/tma-tme/targets")
+        self.assertEqual(code, 200)
+        self.assertEqual(payload["targets"]["global"]["tme_target_seconds"], 240)
+        self.assertEqual(payload["targets"]["global"]["tma_target_seconds"], 900)
+
+        target_row = next((row for row in payload["targets"]["queues"] if row["queue_id"] == queue_id), None)
+        self.assertIsNotNone(target_row)
+        self.assertTrue(target_row["has_custom_target"])
+        self.assertEqual(target_row["tme_target_seconds"], 180)
+        self.assertEqual(target_row["tma_target_seconds"], 720)
+
+    def test_17_quick_reply_crud_and_send(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json(
+            "POST",
+            "/api/quick-replies",
+            {"shortcut": "/saudacao", "body": "Ola! Tudo bem por ai?"},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", "/api/quick-replies")
+        self.assertEqual(code, 200)
+        shortcuts = {item["shortcut"] for item in payload["quick_replies"]}
+        self.assertIn("/saudacao", shortcuts)
+
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/quick-reply",
+            {"shortcut": "/saudacao"},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/messages")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(msg["body"] == "Ola! Tudo bem por ai?" for msg in payload["messages"]))
+
+    def test_18_private_notes_and_schedule_lifecycle(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/notes",
+            {"body": "Cliente informou melhor horario apos as 14h."},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/notes")
+        self.assertEqual(code, 200)
+        self.assertTrue(any("14h" in note["body"] for note in payload["notes"]))
+
+        schedule_at = int(time.time()) + 300
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/schedule-message",
+            {"body": "Lembrete de retorno agendado", "send_at": schedule_at},
+        )
+        self.assertEqual(code, 201)
+        scheduled_id = payload["id"]
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/scheduled-messages")
+        self.assertEqual(code, 200)
+        created = next((item for item in payload["scheduled_messages"] if item["id"] == scheduled_id), None)
+        self.assertIsNotNone(created)
+        self.assertEqual(created["status"], "pending")
+
+        code, payload = self.request_json("POST", f"/api/scheduled-messages/{scheduled_id}/cancel", {})
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/scheduled-messages")
+        self.assertEqual(code, 200)
+        cancelled = next((item for item in payload["scheduled_messages"] if item["id"] == scheduled_id), None)
+        self.assertIsNotNone(cancelled)
+        self.assertEqual(cancelled["status"], "cancelled")
+
+    def test_19_scheduled_worker_sends_due_message(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        auto_text = f"Mensagem automatica {int(time.time())}"
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/schedule-message",
+            {"body": auto_text, "send_at": int(time.time()) - 1},
+        )
+        self.assertEqual(code, 201)
+        scheduled_id = payload["id"]
+
+        sent = False
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            code, current = self.request_json("GET", f"/api/customers/{customer_id}/scheduled-messages")
+            self.assertEqual(code, 200)
+            row = next((item for item in current["scheduled_messages"] if item["id"] == scheduled_id), None)
+            if row and row["status"] == "sent":
+                sent = True
+                break
+            time.sleep(0.4)
+        self.assertTrue(sent, "Mensagem agendada nao foi enviada no prazo esperado")
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/messages")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(msg["body"] == auto_text for msg in payload["messages"]))
+
+    def test_20_team_chat_post_and_list(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json(
+            "POST",
+            "/api/team-messages",
+            {"body": "Pessoal, vou assumir os tickets da fila comercial."},
+        )
+        self.assertEqual(code, 201)
+        self.assertIn("id", payload)
+
+        code, payload = self.request_json("GET", "/api/team-messages?limit=20")
+        self.assertEqual(code, 200)
+        self.assertIn("messages", payload)
+        self.assertTrue(any("fila comercial" in msg["body"] for msg in payload["messages"]))
+
+    def test_21_media_send_and_list(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/media",
+            {
+                "media_type": "image",
+                "url": "https://example.com/fatura.png",
+                "caption": "Segue comprovante",
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/media")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(item["url"] == "https://example.com/fatura.png" for item in payload["media"]))
+
+    def test_22_campaign_create_and_list(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        available = [c for c in payload["customers"] if not c.get("finalized")]
+        self.assertTrue(len(available) >= 1)
+        customer_ids = [available[0]["id"]]
+        if len(available) > 1:
+            customer_ids.append(available[1]["id"])
+
+        campaign_name = f"campanha-auto-{int(time.time())}"
+        code, payload = self.request_json(
+            "POST",
+            "/api/campaigns",
+            {
+                "name": campaign_name,
+                "body": "Mensagem em massa para clientes selecionados.",
+                "customer_ids": customer_ids,
+            },
+        )
+        self.assertEqual(code, 201)
+        self.assertTrue(payload["ok"])
+        self.assertGreaterEqual(payload["sent_total"], 1)
+
+        code, payload = self.request_json("GET", "/api/campaigns?limit=20")
+        self.assertEqual(code, 200)
+        names = [item["name"] for item in payload["campaigns"]]
+        self.assertIn(campaign_name, names)
+
+    def test_23_media_upload_file_and_list(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        encoded = base64.b64encode(b"arquivo de teste").decode("ascii")
+        code, payload = self.request_json(
+            "POST",
+            f"/api/customers/{customer_id}/media-upload",
+            {
+                "media_type": "file",
+                "filename": "comprovante.txt",
+                "content_base64": encoded,
+                "caption": "Comprovante em anexo",
+            },
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+        self.assertTrue(str(payload["url"]).startswith("/uploads/"))
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/media")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(item["url"].startswith("/uploads/") for item in payload["media"]))
+
+    def test_24_ai_suggest_returns_text(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        target = next((c for c in payload["customers"] if not c.get("finalized")), payload["customers"][0])
+        customer_id = target["id"]
+
+        code, payload = self.request_json("POST", f"/api/customers/{customer_id}/ai-suggest", {})
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["provider"] in {"fallback", "openai"})
+        self.assertTrue(isinstance(payload["suggestion"], str))
+        self.assertGreater(len(payload["suggestion"].strip()), 0)
+
+    def test_25_campaign_scheduled_and_export_csv(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/customers")
+        self.assertEqual(code, 200)
+        available = [c for c in payload["customers"] if not c.get("finalized")]
+        self.assertTrue(len(available) >= 1)
+        customer_ids = [available[0]["id"]]
+        scheduled_at = int(time.time()) + 900
+        campaign_name = f"campanha-agendada-{int(time.time())}"
+
+        code, payload = self.request_json(
+            "POST",
+            "/api/campaigns",
+            {
+                "name": campaign_name,
+                "body": "Mensagem agendada da campanha.",
+                "customer_ids": customer_ids,
+                "scheduled_at": scheduled_at,
+                "rate_per_minute": 30,
+            },
+        )
+        self.assertEqual(code, 201)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["rate_per_minute"], 30)
+        self.assertGreaterEqual(payload["queued_total"], 1)
+        campaign_id = payload["campaign_id"]
+
+        code, payload = self.request_json("GET", "/api/campaigns?limit=30")
+        self.assertEqual(code, 200)
+        campaign = next((item for item in payload["campaigns"] if item["id"] == campaign_id), None)
+        self.assertIsNotNone(campaign)
+        self.assertEqual(campaign["rate_per_minute"], 30)
+
+        code, raw_body, headers = self.request_raw("GET", f"/api/campaigns/{campaign_id}/export")
+        self.assertEqual(code, 200)
+        self.assertIn("text/csv", headers.get("Content-Type", ""))
+        decoded = raw_body.decode("utf-8-sig")
+        self.assertIn("campaign_id,campaign_name,campaign_status", decoded)
+        self.assertIn(campaign_name, decoded)
 
 
 if __name__ == "__main__":

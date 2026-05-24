@@ -2,6 +2,10 @@ import hashlib
 import hmac
 import json
 import os
+import base64
+import csv
+import io
+import mimetypes
 import secrets
 import sqlite3
 import threading
@@ -20,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "omnichannel.sqlite3"
 STATIC_DIR = BASE_DIR / "static"
+UPLOADS_DIR = BASE_DIR / "uploads"
 
 def env_int(name, default, minimum=0, maximum=None):
     raw_value = os.environ.get(name)
@@ -52,6 +57,18 @@ WEBHOOK_MAX_ATTEMPTS = env_int("WEBHOOK_MAX_ATTEMPTS", 5, minimum=1, maximum=50)
 DEFAULT_SLA_FIRST_RESPONSE_SECONDS = env_int(
     "DEFAULT_SLA_FIRST_RESPONSE_SECONDS", 900, minimum=60, maximum=86400
 )
+DEFAULT_TME_TARGET_SECONDS = env_int(
+    "DEFAULT_TME_TARGET_SECONDS", 300, minimum=30, maximum=86400
+)
+DEFAULT_TMA_TARGET_SECONDS = env_int(
+    "DEFAULT_TMA_TARGET_SECONDS", 1200, minimum=60, maximum=172800
+)
+SCHEDULE_WORKER_POLL_SECONDS = env_int(
+    "SCHEDULE_WORKER_POLL_SECONDS", 2, minimum=1, maximum=60
+)
+MAX_UPLOAD_BYTES = env_int("MAX_UPLOAD_BYTES", 10485760, minimum=1024, maximum=52428800)
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 SSE_KEEPALIVE_SECONDS = env_int("SSE_KEEPALIVE_SECONDS", 15, minimum=5, maximum=120)
 SSE_SUBSCRIBER_QUEUE_MAX = env_int("SSE_SUBSCRIBER_QUEUE_MAX", 200, minimum=10, maximum=5000)
 
@@ -71,6 +88,8 @@ METRICS = {
     "webhook_dead_lettered_total": 0,
     "messages_processed_total": 0,
     "login_rate_limited_total": 0,
+    "scheduled_processed_total": 0,
+    "scheduled_failed_total": 0,
 }
 EVENT_SUBSCRIBERS = {}
 EVENT_SUBSCRIBERS_LOCK = threading.Lock()
@@ -332,6 +351,114 @@ def init_db():
                 processed_at integer
             );
 
+            create table if not exists quick_replies (
+                id integer primary key autoincrement,
+                shortcut text not null unique,
+                body text not null,
+                created_by_user_id integer,
+                created_at integer not null,
+                updated_at integer not null,
+                foreign key(created_by_user_id) references users(id)
+            );
+
+            create table if not exists private_notes (
+                id integer primary key autoincrement,
+                customer_id integer not null,
+                user_id integer not null,
+                body text not null,
+                created_at integer not null,
+                foreign key(customer_id) references customers(id),
+                foreign key(user_id) references users(id)
+            );
+
+            create table if not exists scheduled_messages (
+                id integer primary key autoincrement,
+                customer_id integer not null,
+                body text not null,
+                send_at integer not null,
+                status text not null check(status in ('pending', 'sent', 'failed', 'cancelled')) default 'pending',
+                created_by_user_id integer not null,
+                external_id text,
+                last_error text,
+                created_at integer not null,
+                sent_at integer,
+                foreign key(customer_id) references customers(id),
+                foreign key(created_by_user_id) references users(id)
+            );
+
+            create table if not exists media_attachments (
+                id integer primary key autoincrement,
+                customer_id integer not null,
+                media_type text not null check(media_type in ('image', 'video', 'gif', 'sticker', 'file')),
+                url text not null,
+                caption text,
+                direction text not null check(direction in ('inbound', 'outbound', 'system')),
+                created_by_user_id integer,
+                created_at integer not null,
+                foreign key(customer_id) references customers(id),
+                foreign key(created_by_user_id) references users(id)
+            );
+
+            create table if not exists team_messages (
+                id integer primary key autoincrement,
+                user_id integer not null,
+                body text not null,
+                created_at integer not null,
+                foreign key(user_id) references users(id)
+            );
+
+            create table if not exists campaigns (
+                id integer primary key autoincrement,
+                name text not null,
+                body text not null,
+                status text not null check(status in ('pending', 'running', 'completed', 'failed')) default 'pending',
+                created_by_user_id integer not null,
+                scheduled_at integer,
+                rate_per_minute integer not null default 120,
+                created_at integer not null,
+                started_at integer not null,
+                finished_at integer,
+                foreign key(created_by_user_id) references users(id)
+            );
+
+            create table if not exists campaign_targets (
+                id integer primary key autoincrement,
+                campaign_id integer not null,
+                customer_id integer not null,
+                status text not null check(status in ('queued', 'sent', 'failed')) default 'queued',
+                last_error text,
+                sent_at integer,
+                foreign key(campaign_id) references campaigns(id),
+                foreign key(customer_id) references customers(id)
+            );
+
+            create table if not exists customer_preferences (
+                customer_id integer primary key,
+                campaign_opt_out integer not null default 0,
+                updated_at integer not null,
+                foreign key(customer_id) references customers(id)
+            );
+
+            create table if not exists ai_suggestions (
+                id integer primary key autoincrement,
+                customer_id integer not null,
+                user_id integer not null,
+                model text not null,
+                prompt text not null,
+                suggestion text not null,
+                latency_ms integer,
+                created_at integer not null,
+                foreign key(customer_id) references customers(id),
+                foreign key(user_id) references users(id)
+            );
+
+            create table if not exists tma_tme_targets (
+                queue_id integer primary key check(queue_id >= 0),
+                tme_target_seconds integer not null,
+                tma_target_seconds integer not null,
+                updated_at integer not null
+            );
+
             create index if not exists idx_customers_assigned_status
             on customers(assigned_operator_id, status);
 
@@ -343,6 +470,24 @@ def init_db():
 
             create index if not exists idx_webhook_events_processed
             on webhook_events(processed, created_at);
+
+            create index if not exists idx_private_notes_customer_created
+            on private_notes(customer_id, created_at desc, id desc);
+
+            create index if not exists idx_scheduled_messages_due
+            on scheduled_messages(status, send_at, id);
+
+            create index if not exists idx_media_customer_created
+            on media_attachments(customer_id, created_at desc, id desc);
+
+            create index if not exists idx_team_messages_created
+            on team_messages(created_at desc, id desc);
+
+            create index if not exists idx_campaign_targets_campaign
+            on campaign_targets(campaign_id, status, id);
+
+            create index if not exists idx_ai_suggestions_customer_created
+            on ai_suggestions(customer_id, created_at desc, id desc);
             """
         )
 
@@ -373,6 +518,51 @@ def init_db():
             conn.execute("alter table webhook_events add column attempts integer not null default 0")
         if "last_error" not in webhook_cols:
             conn.execute("alter table webhook_events add column last_error text")
+        campaign_cols = [row["name"] for row in conn.execute("pragma table_info(campaigns)").fetchall()]
+        if "scheduled_at" not in campaign_cols:
+            conn.execute("alter table campaigns add column scheduled_at integer")
+        if "rate_per_minute" not in campaign_cols:
+            conn.execute("alter table campaigns add column rate_per_minute integer not null default 120")
+        campaign_targets_table = conn.execute(
+            "select sql from sqlite_master where type = 'table' and name = 'campaign_targets'"
+        ).fetchone()
+        campaign_targets_sql = (campaign_targets_table["sql"] or "").lower() if campaign_targets_table else ""
+        if campaign_targets_table and "queued" not in campaign_targets_sql:
+            conn.execute("pragma foreign_keys = OFF")
+            conn.executescript(
+                """
+                create table campaign_targets_migrated (
+                    id integer primary key autoincrement,
+                    campaign_id integer not null,
+                    customer_id integer not null,
+                    status text not null check(status in ('queued', 'sent', 'failed')) default 'queued',
+                    last_error text,
+                    sent_at integer,
+                    foreign key(campaign_id) references campaigns(id),
+                    foreign key(customer_id) references customers(id)
+                );
+
+                insert into campaign_targets_migrated (id, campaign_id, customer_id, status, last_error, sent_at)
+                select
+                    id,
+                    campaign_id,
+                    customer_id,
+                    case
+                        when lower(status) = 'sent' then 'sent'
+                        when lower(status) = 'failed' then 'failed'
+                        else 'failed'
+                    end,
+                    last_error,
+                    sent_at
+                from campaign_targets;
+
+                drop table campaign_targets;
+                alter table campaign_targets_migrated rename to campaign_targets;
+                create index if not exists idx_campaign_targets_campaign
+                on campaign_targets(campaign_id, status, id);
+                """
+            )
+            conn.execute("pragma foreign_keys = ON")
 
         if not conn.execute("select 1 from users limit 1").fetchone():
             admin_hash = password_hash("admin123")
@@ -454,6 +644,25 @@ def init_db():
         if master_user and verify_password("admin123", master_user["password_hash"]):
             conn.execute("update users set must_change_password = 1 where id = ?", (master_user["id"],))
 
+        baseline_operator_permissions = {
+            "team:chat",
+            "notes:write",
+            "media:send",
+            "schedule:manage",
+            "quick_reply:send",
+            "ai:suggest",
+        }
+        operator_rows = conn.execute(
+            "select id, permissions from users where role = 'operator' and active = 1"
+        ).fetchall()
+        for row in operator_rows:
+            merged_permissions = parse_permissions(row["permissions"] or "[]")
+            merged_permissions.update(baseline_operator_permissions)
+            conn.execute(
+                "update users set permissions = ? where id = ?",
+                (json.dumps(sorted(merged_permissions), ensure_ascii=False), row["id"]),
+            )
+
         conn.execute(
             "update customers set sla_due_at = coalesce(sla_due_at, created_at + ?) where sla_due_at is null",
             (DEFAULT_SLA_FIRST_RESPONSE_SECONDS,),
@@ -461,6 +670,14 @@ def init_db():
         conn.execute(
             "update customers set closed_at = coalesce(closed_at, ?) where status = 'closed' and closed_at is null",
             (now_ts(),),
+        )
+        conn.execute(
+            """
+            insert into tma_tme_targets (queue_id, tme_target_seconds, tma_target_seconds, updated_at)
+            values (0, ?, ?, ?)
+            on conflict(queue_id) do nothing
+            """,
+            (DEFAULT_TME_TARGET_SECONDS, DEFAULT_TMA_TARGET_SECONDS, now_ts()),
         )
 
 
@@ -489,6 +706,52 @@ def parse_permissions(raw_value):
     except json.JSONDecodeError:
         pass
     return set()
+
+
+def user_has_permission(user, permission):
+    if not user:
+        return False
+    if user.get("role") == "admin":
+        return True
+    return permission in parse_permissions(user.get("permissions", "[]"))
+
+
+def normalize_avg_seconds(value):
+    if value is None:
+        return 0
+    return int(round(value))
+
+
+def percentage(value, total):
+    if not total:
+        return 0.0
+    return round((float(value) / float(total)) * 100.0, 2)
+
+
+def load_tma_tme_targets(conn):
+    rows = conn.execute(
+        "select queue_id, tme_target_seconds, tma_target_seconds, updated_at from tma_tme_targets"
+    ).fetchall()
+    global_target = {
+        "queue_id": 0,
+        "tme_target_seconds": DEFAULT_TME_TARGET_SECONDS,
+        "tma_target_seconds": DEFAULT_TMA_TARGET_SECONDS,
+        "updated_at": None,
+    }
+    by_queue = {}
+    for row in rows:
+        queue_id = int(row["queue_id"])
+        item = {
+            "queue_id": queue_id,
+            "tme_target_seconds": int(row["tme_target_seconds"]),
+            "tma_target_seconds": int(row["tma_target_seconds"]),
+            "updated_at": int(row["updated_at"]),
+        }
+        if queue_id == 0:
+            global_target = item
+        else:
+            by_queue[queue_id] = item
+    return global_target, by_queue
 
 
 def log_structured(event, request_id, **fields):
@@ -528,6 +791,12 @@ def metrics_payload():
         "# HELP messages_processed_total Inbound messages processed by worker.",
         "# TYPE messages_processed_total counter",
         f"messages_processed_total {METRICS['messages_processed_total']}",
+        "# HELP scheduled_processed_total Scheduled messages processed.",
+        "# TYPE scheduled_processed_total counter",
+        f"scheduled_processed_total {METRICS['scheduled_processed_total']}",
+        "# HELP scheduled_failed_total Scheduled messages failed.",
+        "# TYPE scheduled_failed_total counter",
+        f"scheduled_failed_total {METRICS['scheduled_failed_total']}",
         "# HELP login_rate_limited_total Login requests rejected by rate limiting.",
         "# TYPE login_rate_limited_total counter",
         f"login_rate_limited_total {METRICS['login_rate_limited_total']}",
@@ -588,6 +857,286 @@ class EvolutionClient:
 
 
 evolution = EvolutionClient()
+
+
+def extract_response_output_text(response_payload):
+    text = str(response_payload.get("output_text") or "").strip()
+    if text:
+        return text
+    output_items = response_payload.get("output") or []
+    for output_item in output_items:
+        if output_item.get("type") != "message":
+            continue
+        for content in output_item.get("content") or []:
+            maybe_text = content.get("text")
+            if isinstance(maybe_text, str) and maybe_text.strip():
+                return maybe_text.strip()
+            if isinstance(maybe_text, dict):
+                value = maybe_text.get("value")
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    return ""
+
+
+def generate_ai_suggestion(customer_name, conversation_text):
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY nÃ£o configurada")
+    system_prompt = (
+        "VocÃª Ã© assistente de suporte de um call center WhatsApp. "
+        "Responda em portuguÃªs do Brasil, com objetividade, empatia e tom profissional. "
+        "NÃ£o invente informaÃ§Ãµes; se faltar contexto, diga quais dados faltam. "
+        "Retorne apenas o texto sugerido para o operador enviar ao cliente."
+    )
+    request_payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": system_prompt}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": f"Cliente: {customer_name}\n\nHistÃ³rico recente:\n{conversation_text}",
+                    }
+                ],
+            },
+        ],
+        "max_output_tokens": 240,
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(request_payload, ensure_ascii=False).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    started = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=25) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Erro OpenAI HTTP {exc.code}: {detail[:240]}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Falha de rede OpenAI: {exc}")
+    parsed = json.loads(raw)
+    suggestion = extract_response_output_text(parsed)
+    if not suggestion:
+        raise RuntimeError("OpenAI retornou resposta sem texto utilizÃ¡vel")
+    latency_ms = int((time.time() - started) * 1000)
+    return suggestion, latency_ms
+
+
+def store_uploaded_file(filename, content_bytes):
+    if not content_bytes:
+        raise ValueError("arquivo vazio")
+    if len(content_bytes) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"arquivo excede limite de {MAX_UPLOAD_BYTES} bytes")
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    safe_ext = Path(str(filename or "")).suffix.lower()
+    if safe_ext not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".txt", ".mp4", ".webm", ".ogg"}:
+        safe_ext = ".bin"
+    file_name = f"{now_ts()}_{uuid.uuid4().hex}{safe_ext}"
+    target = UPLOADS_DIR / file_name
+    target.write_bytes(content_bytes)
+    return f"/uploads/{file_name}"
+
+
+def dispatch_outbound_text(phone, text):
+    external_id = None
+    status = "sent"
+    if evolution.configured():
+        response = evolution.send_text(phone, text)
+        external_id = str(response.get("key", {}).get("id") or response.get("messageId") or "")
+    return status, external_id
+
+
+def process_due_scheduled_messages(limit=50):
+    now = now_ts()
+    processed = 0
+    with db() as conn:
+        rows = conn.execute(
+            """
+            select id, customer_id, body, send_at
+            from scheduled_messages
+            where status = 'pending' and send_at <= ?
+            order by send_at asc, id asc
+            limit ?
+            """,
+            (now, limit),
+        ).fetchall()
+        for row in rows:
+            customer = conn.execute(
+                "select id, phone, finalized from customers where id = ?",
+                (row["customer_id"],),
+            ).fetchone()
+            if not customer:
+                conn.execute(
+                    "update scheduled_messages set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                    ("customer_not_found", now, row["id"]),
+                )
+                METRICS["scheduled_failed_total"] += 1
+                continue
+            if customer["finalized"]:
+                conn.execute(
+                    "update scheduled_messages set status = 'cancelled', last_error = ?, sent_at = ? where id = ?",
+                    ("customer_finalized", now, row["id"]),
+                )
+                continue
+            try:
+                status, external_id = dispatch_outbound_text(customer["phone"], row["body"])
+                send_ts = now_ts()
+                conn.execute(
+                    """
+                    insert into messages (customer_id, direction, body, status, external_id, created_at)
+                    values (?, 'outbound', ?, ?, ?, ?)
+                    """,
+                    (row["customer_id"], row["body"], status, external_id, send_ts),
+                )
+                conn.execute(
+                    "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+                    (send_ts, send_ts, row["customer_id"]),
+                )
+                conn.execute(
+                    "update scheduled_messages set status = 'sent', external_id = ?, sent_at = ?, last_error = null where id = ?",
+                    (external_id, send_ts, row["id"]),
+                )
+                METRICS["scheduled_processed_total"] += 1
+                processed += 1
+                publish_realtime_event(
+                    "ticket.updated",
+                    {"customer_id": row["customer_id"], "kind": "scheduled_message_sent"},
+                    customer_id=row["customer_id"],
+                )
+            except Exception as exc:
+                conn.execute(
+                    "update scheduled_messages set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                    (str(exc), now_ts(), row["id"]),
+                )
+                METRICS["scheduled_failed_total"] += 1
+                log_structured("scheduled.failed", "-", scheduled_id=row["id"], error=str(exc))
+    return processed
+
+
+def process_pending_campaign_dispatches(limit_campaigns=3):
+    now = now_ts()
+    dispatched = 0
+    with db() as conn:
+        campaigns = conn.execute(
+            """
+            select id, body, status, rate_per_minute
+            from campaigns
+            where status in ('pending', 'running')
+              and (scheduled_at is null or scheduled_at <= ?)
+            order by created_at asc, id asc
+            limit ?
+            """,
+            (now, limit_campaigns),
+        ).fetchall()
+        for campaign in campaigns:
+            campaign_id = int(campaign["id"])
+            if campaign["status"] == "pending":
+                conn.execute(
+                    "update campaigns set status = 'running', started_at = ? where id = ? and status = 'pending'",
+                    (now_ts(), campaign_id),
+                )
+            rate_per_minute = int(campaign["rate_per_minute"] or 120)
+            rate_per_minute = max(1, min(rate_per_minute, 600))
+            dispatch_window = max(1, int((rate_per_minute * SCHEDULE_WORKER_POLL_SECONDS) / 60))
+            targets = conn.execute(
+                """
+                select ct.id, ct.customer_id
+                from campaign_targets ct
+                where ct.campaign_id = ? and ct.status = 'queued'
+                order by ct.id asc
+                limit ?
+                """,
+                (campaign_id, dispatch_window),
+            ).fetchall()
+            for target in targets:
+                target_id = int(target["id"])
+                customer_id = int(target["customer_id"])
+                customer = conn.execute(
+                    "select id, phone, finalized from customers where id = ?",
+                    (customer_id,),
+                ).fetchone()
+                pref = conn.execute(
+                    "select campaign_opt_out from customer_preferences where customer_id = ?",
+                    (customer_id,),
+                ).fetchone()
+                if not customer:
+                    conn.execute(
+                        "update campaign_targets set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                        ("customer_not_found", now_ts(), target_id),
+                    )
+                    continue
+                if customer["finalized"]:
+                    conn.execute(
+                        "update campaign_targets set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                        ("customer_finalized", now_ts(), target_id),
+                    )
+                    continue
+                if pref and int(pref["campaign_opt_out"] or 0) == 1:
+                    conn.execute(
+                        "update campaign_targets set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                        ("campaign_opt_out", now_ts(), target_id),
+                    )
+                    continue
+                try:
+                    status, external_id = dispatch_outbound_text(customer["phone"], campaign["body"])
+                    send_ts = now_ts()
+                    conn.execute(
+                        """
+                        insert into messages (customer_id, direction, body, status, external_id, created_at)
+                        values (?, 'outbound', ?, ?, ?, ?)
+                        """,
+                        (customer_id, campaign["body"], status, external_id, send_ts),
+                    )
+                    conn.execute(
+                        "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+                        (send_ts, send_ts, customer_id),
+                    )
+                    conn.execute(
+                        "update campaign_targets set status = 'sent', last_error = null, sent_at = ? where id = ?",
+                        (send_ts, target_id),
+                    )
+                    dispatched += 1
+                    publish_realtime_event(
+                        "ticket.updated",
+                        {"customer_id": customer_id, "kind": "campaign_message_sent", "campaign_id": campaign_id},
+                        customer_id=customer_id,
+                    )
+                except Exception as exc:
+                    conn.execute(
+                        "update campaign_targets set status = 'failed', last_error = ?, sent_at = ? where id = ?",
+                        (str(exc), now_ts(), target_id),
+                    )
+            pending_left = conn.execute(
+                "select count(*) total from campaign_targets where campaign_id = ? and status = 'queued'",
+                (campaign_id,),
+            ).fetchone()["total"]
+            if int(pending_left or 0) == 0:
+                stats = conn.execute(
+                    """
+                    select
+                        sum(case when status = 'sent' then 1 else 0 end) sent_total,
+                        sum(case when status = 'failed' then 1 else 0 end) failed_total
+                    from campaign_targets
+                    where campaign_id = ?
+                    """,
+                    (campaign_id,),
+                ).fetchone()
+                final_status = "completed" if int(stats["sent_total"] or 0) > 0 else "failed"
+                conn.execute(
+                    "update campaigns set status = ?, finished_at = ? where id = ?",
+                    (final_status, now_ts(), campaign_id),
+                )
+    return dispatched
 
 
 def process_inbound_payload(payload):
@@ -758,6 +1307,16 @@ def webhook_worker():
             time.sleep(0.2)
 
 
+def scheduled_messages_worker():
+    while True:
+        try:
+            process_due_scheduled_messages(limit=50)
+            process_pending_campaign_dispatches(limit_campaigns=3)
+        except Exception as exc:
+            log_structured("scheduled.worker_error", "-", error=str(exc))
+        time.sleep(SCHEDULE_WORKER_POLL_SECONDS)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "OmniChannel/1.0"
 
@@ -780,11 +1339,10 @@ class Handler(BaseHTTPRequestHandler):
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
-        content_type = "text/html; charset=utf-8"
-        if path.suffix == ".css":
-            content_type = "text/css; charset=utf-8"
-        elif path.suffix == ".js":
-            content_type = "application/javascript; charset=utf-8"
+        guessed_type, _ = mimetypes.guess_type(str(path))
+        content_type = guessed_type or "application/octet-stream"
+        if content_type.startswith("text/") or path.suffix in {".js", ".mjs", ".json"}:
+            content_type = f"{content_type}; charset=utf-8"
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
@@ -861,6 +1419,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "ID de cliente inválido"}, HTTPStatus.BAD_REQUEST)
             return True, None
         return True, customer_id
+
+    def _extract_scheduled_message_id(self, path, action):
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "api" or parts[1] != "scheduled-messages" or parts[3] != action:
+            return False, None
+        try:
+            scheduled_message_id = int(parts[2])
+            if scheduled_message_id <= 0:
+                raise ValueError
+        except ValueError:
+            self.send_json({"error": "ID de agendamento invÃ¡lido"}, HTTPStatus.BAD_REQUEST)
+            return True, None
+        return True, scheduled_message_id
+
+    def _extract_campaign_id(self, path, action):
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[0] != "api" or parts[1] != "campaigns" or parts[3] != action:
+            return False, None
+        try:
+            campaign_id = int(parts[2])
+            if campaign_id <= 0:
+                raise ValueError
+        except ValueError:
+            self.send_json({"error": "ID de campanha invÃ¡lido"}, HTTPStatus.BAD_REQUEST)
+            return True, None
+        return True, campaign_id
 
     def client_ip(self):
         forwarded = self.headers.get("X-Forwarded-For", "")
@@ -959,6 +1543,9 @@ class Handler(BaseHTTPRequestHandler):
                     pending_webhooks = conn.execute(
                         "select count(*) total from webhook_events where processed = 0"
                     ).fetchone()["total"]
+                    pending_scheduled = conn.execute(
+                        "select count(*) total from scheduled_messages where status = 'pending'"
+                    ).fetchone()["total"]
                 with WEBHOOK_COND:
                     queue_depth = len(WEBHOOK_QUEUE)
                 with EVENT_SUBSCRIBERS_LOCK:
@@ -969,6 +1556,7 @@ class Handler(BaseHTTPRequestHandler):
                         "ts": now_ts(),
                         "queue_depth": queue_depth,
                         "pending_webhooks": pending_webhooks,
+                        "pending_scheduled_messages": pending_scheduled,
                         "max_webhook_queue_size": MAX_WEBHOOK_QUEUE_SIZE,
                         "realtime_subscribers": realtime_subscribers,
                     }
@@ -987,6 +1575,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.send_file(STATIC_DIR / safe)
                 return
+            if path.startswith("/uploads/"):
+                safe = Path(path.replace("/uploads/", "", 1))
+                if ".." in safe.parts:
+                    self.send_error(HTTPStatus.BAD_REQUEST)
+                    return
+                self.send_file(UPLOADS_DIR / safe)
+                return
             if path == "/api/me":
                 user = self.current_user()
                 self.send_json({"user": user})
@@ -999,6 +1594,21 @@ class Handler(BaseHTTPRequestHandler):
                 if customer_id is not None:
                     self.api_messages(customer_id)
                 return
+            matched, customer_id = self._extract_customer_id(path, "notes")
+            if matched:
+                if customer_id is not None:
+                    self.api_private_notes(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "scheduled-messages")
+            if matched:
+                if customer_id is not None:
+                    self.api_scheduled_messages(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "media")
+            if matched:
+                if customer_id is not None:
+                    self.api_customer_media(customer_id)
+                return
             matched, customer_id = self._extract_customer_id(path, "erp")
             if matched:
                 if customer_id is not None:
@@ -1010,11 +1620,31 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/queues":
                 self.api_queues()
                 return
+            if path == "/api/quick-replies":
+                self.api_quick_replies()
+                return
+            if path == "/api/team-messages":
+                self.api_team_messages()
+                return
+            if path == "/api/campaigns":
+                self.api_campaigns()
+                return
+            matched, campaign_id = self._extract_campaign_id(path, "export")
+            if matched:
+                if campaign_id is not None:
+                    self.api_export_campaign_csv(campaign_id)
+                return
             if path == "/api/dashboard":
                 self.api_dashboard()
                 return
             if path == "/api/sla":
                 self.api_sla()
+                return
+            if path == "/api/tma-tme":
+                self.api_tma_tme(parsed)
+                return
+            if path == "/api/tma-tme/targets":
+                self.api_tma_tme_targets()
                 return
             if path == "/api/dashboard/intelligence":
                 self.api_dashboard_intelligence()
@@ -1054,6 +1684,41 @@ class Handler(BaseHTTPRequestHandler):
                 if customer_id is not None:
                     self.api_send_message(customer_id)
                 return
+            matched, customer_id = self._extract_customer_id(path, "quick-reply")
+            if matched:
+                if customer_id is not None:
+                    self.api_send_quick_reply(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "notes")
+            if matched:
+                if customer_id is not None:
+                    self.api_add_private_note(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "schedule-message")
+            if matched:
+                if customer_id is not None:
+                    self.api_schedule_message(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "media")
+            if matched:
+                if customer_id is not None:
+                    self.api_send_media(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "media-upload")
+            if matched:
+                if customer_id is not None:
+                    self.api_upload_media_file(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "campaign-opt-out")
+            if matched:
+                if customer_id is not None:
+                    self.api_set_campaign_opt_out(customer_id)
+                return
+            matched, customer_id = self._extract_customer_id(path, "ai-suggest")
+            if matched:
+                if customer_id is not None:
+                    self.api_ai_suggest(customer_id)
+                return
             matched, customer_id = self._extract_customer_id(path, "assign")
             if matched:
                 if customer_id is not None:
@@ -1090,6 +1755,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/evolution/set-webhook":
                 self.api_set_webhook()
                 return
+            if path == "/api/quick-replies":
+                self.api_upsert_quick_reply()
+                return
+            if path == "/api/team-messages":
+                self.api_post_team_message()
+                return
+            if path == "/api/campaigns":
+                self.api_create_campaign()
+                return
+            matched, scheduled_message_id = self._extract_scheduled_message_id(path, "cancel")
+            if matched:
+                if scheduled_message_id is not None:
+                    self.api_cancel_scheduled_message(scheduled_message_id)
+                return
             if path == "/api/webhook/evolution":
                 self.api_webhook_evolution()
                 return
@@ -1098,6 +1777,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/change-password":
                 self.api_change_password()
+                return
+            if path == "/api/tma-tme/targets":
+                self.api_update_tma_tme_targets()
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except APIError as exc:
@@ -1214,10 +1896,11 @@ class Handler(BaseHTTPRequestHandler):
         with db() as conn:
             rows = conn.execute(
                 f"""
-                select c.*, q.name queue_name, q.color queue_color, u.name operator_name
+                select c.*, q.name queue_name, q.color queue_color, u.name operator_name, coalesce(cp.campaign_opt_out, 0) campaign_opt_out
                 from customers c
                 join queues q on q.id = c.queue_id
                 left join users u on u.id = c.assigned_operator_id
+                left join customer_preferences cp on cp.customer_id = c.id
                 where {where_sql}
                 order by coalesce(c.last_message_at, c.created_at) desc
                 limit ? offset ?
@@ -1239,6 +1922,792 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchall()
         self.send_json({"messages": [dict(row) for row in rows]})
 
+    def api_quick_replies(self):
+        user = self.require_user()
+        if not user:
+            return
+        with db() as conn:
+            rows = conn.execute(
+                "select id, shortcut, body, created_by_user_id, created_at, updated_at from quick_replies order by shortcut asc"
+            ).fetchall()
+        self.send_json({"quick_replies": [dict(row) for row in rows]})
+
+    def api_upsert_quick_reply(self):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode gerenciar frases rÃ¡pidas"}, HTTPStatus.FORBIDDEN)
+            return
+        payload = self.read_json()
+        shortcut = str(payload.get("shortcut") or "").strip()
+        body = str(payload.get("body") or "").strip()
+        if not shortcut or not body:
+            self.send_json({"error": "shortcut e body sÃ£o obrigatÃ³rios"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(shortcut) > 64:
+            self.send_json({"error": "shortcut excede o limite de 64 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(body) > 4096:
+            self.send_json({"error": "body excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            conn.execute(
+                """
+                insert into quick_replies (shortcut, body, created_by_user_id, created_at, updated_at)
+                values (?, ?, ?, ?, ?)
+                on conflict(shortcut) do update set
+                    body = excluded.body,
+                    created_by_user_id = excluded.created_by_user_id,
+                    updated_at = excluded.updated_at
+                """,
+                (shortcut, body, user["id"], now_ts(), now_ts()),
+            )
+        log_action(user["id"], "quick_reply.upsert", {"shortcut": shortcut})
+        self.send_json({"ok": True})
+
+    def api_team_messages(self):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "team:chat"):
+            self.send_json({"error": "Sem permissao team:chat"}, HTTPStatus.FORBIDDEN)
+            return
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(query.get("limit", ["100"])[0])
+        except (TypeError, ValueError):
+            self.send_json({"error": "Parametro limit invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        limit = max(1, min(limit, 200))
+        with db() as conn:
+            rows = conn.execute(
+                """
+                select tm.id, tm.user_id, tm.body, tm.created_at, coalesce(u.name, 'Usuario') user_name
+                from team_messages tm
+                left join users u on u.id = tm.user_id
+                order by tm.created_at desc, tm.id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        self.send_json({"messages": [dict(row) for row in rows]})
+
+    def api_post_team_message(self):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "team:chat"):
+            self.send_json({"error": "Sem permissao team:chat"}, HTTPStatus.FORBIDDEN)
+            return
+        payload = self.read_json()
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            self.send_json({"error": "Mensagem vazia"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(body) > 4096:
+            self.send_json({"error": "Mensagem excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            cursor = conn.execute(
+                "insert into team_messages (user_id, body, created_at) values (?, ?, ?)",
+                (user["id"], body, now_ts()),
+            )
+        log_action(user["id"], "team_message.posted", {"team_message_id": cursor.lastrowid})
+        self.send_json({"ok": True, "id": cursor.lastrowid}, HTTPStatus.CREATED)
+
+    def api_customer_media(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        with db() as conn:
+            rows = conn.execute(
+                """
+                select
+                    m.id,
+                    m.customer_id,
+                    m.media_type,
+                    m.url,
+                    m.caption,
+                    m.direction,
+                    m.created_by_user_id,
+                    m.created_at,
+                    coalesce(u.name, 'Usuario') created_by_name
+                from media_attachments m
+                left join users u on u.id = m.created_by_user_id
+                where m.customer_id = ?
+                order by m.created_at desc, m.id desc
+                """,
+                (customer_id,),
+            ).fetchall()
+        self.send_json({"media": [dict(row) for row in rows]})
+
+    def api_send_media(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "media:send"):
+            self.send_json({"error": "Sem permissao media:send"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        if self.customer_is_finalized(customer_id):
+            self.send_json({"error": "Atendimento finalizado. Novas acoes estao bloqueadas."}, HTTPStatus.CONFLICT)
+            return
+        payload = self.read_json()
+        media_type = str(payload.get("media_type") or "").strip().lower()
+        url = str(payload.get("url") or "").strip()
+        caption = str(payload.get("caption") or "").strip()
+        if media_type not in {"image", "video", "gif", "sticker", "file"}:
+            self.send_json({"error": "media_type invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not url:
+            self.send_json({"error": "url e obrigatoria"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(url) > 2048:
+            self.send_json({"error": "url excede o limite"}, HTTPStatus.BAD_REQUEST)
+            return
+        if caption and len(caption) > 1024:
+            self.send_json({"error": "caption excede o limite de 1024 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            customer = conn.execute("select id from customers where id = ?", (customer_id,)).fetchone()
+            if not customer:
+                self.send_json({"error": "Cliente nao encontrado"}, HTTPStatus.NOT_FOUND)
+                return
+            conn.execute(
+                """
+                insert into media_attachments
+                (customer_id, media_type, url, caption, direction, created_by_user_id, created_at)
+                values (?, ?, ?, ?, 'outbound', ?, ?)
+                """,
+                (customer_id, media_type, url, caption or None, user["id"], now_ts()),
+            )
+            media_line = f"[media:{media_type}] {url}"
+            text = f"{media_line}\n{caption}" if caption else media_line
+            status = self._send_outbound_for_customer(conn, customer_id, text)
+        log_action(user["id"], "media.sent", {"customer_id": customer_id, "media_type": media_type})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "media_sent", "media_type": media_type, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
+        self.send_json({"ok": True, "status": status})
+
+    def api_upload_media_file(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "media:send"):
+            self.send_json({"error": "Sem permissao media:send"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        if self.customer_is_finalized(customer_id):
+            self.send_json({"error": "Atendimento finalizado. Novas acoes estao bloqueadas."}, HTTPStatus.CONFLICT)
+            return
+        payload = self.read_json()
+        media_type = str(payload.get("media_type") or "").strip().lower()
+        filename = str(payload.get("filename") or "").strip()
+        content_base64 = str(payload.get("content_base64") or "").strip()
+        caption = str(payload.get("caption") or "").strip()
+        if media_type not in {"image", "video", "gif", "sticker", "file"}:
+            self.send_json({"error": "media_type invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not filename or not content_base64:
+            self.send_json({"error": "filename e content_base64 sao obrigatorios"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            file_bytes = base64.b64decode(content_base64, validate=True)
+        except Exception:
+            self.send_json({"error": "content_base64 invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            file_url = store_uploaded_file(filename, file_bytes)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            conn.execute(
+                """
+                insert into media_attachments
+                (customer_id, media_type, url, caption, direction, created_by_user_id, created_at)
+                values (?, ?, ?, ?, 'outbound', ?, ?)
+                """,
+                (customer_id, media_type, file_url, caption or None, user["id"], now_ts()),
+            )
+            media_line = f"[media:{media_type}] {file_url}"
+            text = f"{media_line}\n{caption}" if caption else media_line
+            status = self._send_outbound_for_customer(conn, customer_id, text)
+        log_action(user["id"], "media.uploaded", {"customer_id": customer_id, "media_type": media_type, "url": file_url})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "media_uploaded", "media_type": media_type, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
+        self.send_json({"ok": True, "status": status, "url": file_url})
+
+    def api_set_campaign_opt_out(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode alterar opt-out de campanha"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        payload = self.read_json()
+        value = bool(payload.get("opt_out", True))
+        with db() as conn:
+            conn.execute(
+                """
+                insert into customer_preferences (customer_id, campaign_opt_out, updated_at)
+                values (?, ?, ?)
+                on conflict(customer_id) do update set
+                    campaign_opt_out = excluded.campaign_opt_out,
+                    updated_at = excluded.updated_at
+                """,
+                (customer_id, 1 if value else 0, now_ts()),
+            )
+        log_action(user["id"], "campaign.opt_out_updated", {"customer_id": customer_id, "opt_out": value})
+        self.send_json({"ok": True, "customer_id": customer_id, "opt_out": value})
+
+    def api_ai_suggest(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "ai:suggest"):
+            self.send_json({"error": "Sem permissao ai:suggest"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        with db() as conn:
+            customer = conn.execute("select id, name from customers where id = ?", (customer_id,)).fetchone()
+            if not customer:
+                self.send_json({"error": "Cliente nao encontrado"}, HTTPStatus.NOT_FOUND)
+                return
+            rows = conn.execute(
+                "select direction, body, created_at from messages where customer_id = ? order by created_at desc, id desc limit 10",
+                (customer_id,),
+            ).fetchall()
+        conversation_lines = []
+        for row in reversed(rows):
+            role = "Cliente" if row["direction"] == "inbound" else "Operador"
+            conversation_lines.append(f"{role}: {row['body']}")
+        conversation_text = "\n".join(conversation_lines) if conversation_lines else "Sem mensagens anteriores."
+        try:
+            suggestion, latency_ms = generate_ai_suggestion(customer["name"], conversation_text)
+        except RuntimeError as exc:
+            fallback = (
+                "Entendi seu contexto. Vou verificar o seu caso agora e te retorno em seguida com os prÃ³ximos passos."
+            )
+            with db() as conn:
+                conn.execute(
+                    """
+                    insert into ai_suggestions (customer_id, user_id, model, prompt, suggestion, latency_ms, created_at)
+                    values (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (customer_id, user["id"], "local-fallback", conversation_text, fallback, None, now_ts()),
+                )
+            self.send_json({"suggestion": fallback, "provider": "fallback", "error": str(exc)})
+            return
+        with db() as conn:
+            conn.execute(
+                """
+                insert into ai_suggestions (customer_id, user_id, model, prompt, suggestion, latency_ms, created_at)
+                values (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (customer_id, user["id"], OPENAI_MODEL, conversation_text, suggestion, latency_ms, now_ts()),
+            )
+        log_action(user["id"], "ai.suggested", {"customer_id": customer_id, "latency_ms": latency_ms, "model": OPENAI_MODEL})
+        self.send_json({"suggestion": suggestion, "provider": "openai", "model": OPENAI_MODEL, "latency_ms": latency_ms})
+
+    def api_campaigns(self):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode visualizar campanhas"}, HTTPStatus.FORBIDDEN)
+            return
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            limit = int(query.get("limit", ["50"])[0])
+        except (TypeError, ValueError):
+            self.send_json({"error": "Parametro limit invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        limit = max(1, min(limit, 200))
+        with db() as conn:
+            rows = conn.execute(
+                """
+                select
+                    c.id,
+                    c.name,
+                    c.body,
+                    c.status,
+                    c.created_by_user_id,
+                    c.scheduled_at,
+                    c.rate_per_minute,
+                    c.created_at,
+                    c.started_at,
+                    c.finished_at,
+                    coalesce(u.name, 'Usuario') created_by_name,
+                    count(ct.id) total_targets,
+                    sum(case when ct.status = 'queued' then 1 else 0 end) queued_total,
+                    sum(case when ct.status = 'sent' then 1 else 0 end) sent_total,
+                    sum(case when ct.status = 'failed' then 1 else 0 end) failed_total
+                from campaigns c
+                left join users u on u.id = c.created_by_user_id
+                left join campaign_targets ct on ct.campaign_id = c.id
+                group by c.id, c.name, c.body, c.status, c.created_by_user_id, c.scheduled_at, c.rate_per_minute, c.created_at, c.started_at, c.finished_at, u.name
+                order by c.created_at desc, c.id desc
+                limit ?
+                """,
+                (limit,),
+            ).fetchall()
+        payload = []
+        for row in rows:
+            item = dict(row)
+            item["total_targets"] = int(item.get("total_targets") or 0)
+            item["queued_total"] = int(item.get("queued_total") or 0)
+            item["sent_total"] = int(item.get("sent_total") or 0)
+            item["failed_total"] = int(item.get("failed_total") or 0)
+            item["rate_per_minute"] = int(item.get("rate_per_minute") or 0)
+            payload.append(item)
+        self.send_json({"campaigns": payload})
+
+    def api_create_campaign(self):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode disparar campanhas"}, HTTPStatus.FORBIDDEN)
+            return
+        payload = self.read_json()
+        name = str(payload.get("name") or "").strip()
+        body = str(payload.get("body") or "").strip()
+        customer_ids_raw = payload.get("customer_ids")
+        scheduled_at_raw = payload.get("scheduled_at")
+        rate_per_minute_raw = payload.get("rate_per_minute", 120)
+        if not name:
+            self.send_json({"error": "name e obrigatorio"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not body:
+            self.send_json({"error": "body e obrigatorio"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(name) > 120:
+            self.send_json({"error": "name excede o limite de 120 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(body) > 4096:
+            self.send_json({"error": "body excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        scheduled_at = None
+        if scheduled_at_raw not in (None, ""):
+            try:
+                scheduled_at = int(scheduled_at_raw)
+            except (TypeError, ValueError):
+                self.send_json({"error": "scheduled_at invalido"}, HTTPStatus.BAD_REQUEST)
+                return
+            if scheduled_at <= 0:
+                self.send_json({"error": "scheduled_at invalido"}, HTTPStatus.BAD_REQUEST)
+                return
+        try:
+            rate_per_minute = int(rate_per_minute_raw)
+        except (TypeError, ValueError):
+            self.send_json({"error": "rate_per_minute invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if rate_per_minute < 1 or rate_per_minute > 600:
+            self.send_json({"error": "rate_per_minute deve ficar entre 1 e 600"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not isinstance(customer_ids_raw, list) or not customer_ids_raw:
+            self.send_json({"error": "customer_ids deve ser uma lista com pelo menos um cliente"}, HTTPStatus.BAD_REQUEST)
+            return
+        normalized_ids = []
+        seen = set()
+        for item in customer_ids_raw:
+            try:
+                customer_id = int(item)
+            except (TypeError, ValueError):
+                self.send_json({"error": "customer_ids contem valor invalido"}, HTTPStatus.BAD_REQUEST)
+                return
+            if customer_id <= 0:
+                self.send_json({"error": "customer_ids contem valor invalido"}, HTTPStatus.BAD_REQUEST)
+                return
+            if customer_id not in seen:
+                seen.add(customer_id)
+                normalized_ids.append(customer_id)
+        if len(normalized_ids) > 1000:
+            self.send_json({"error": "Limite maximo de 1000 clientes por campanha"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        now = now_ts()
+        placeholders = ",".join("?" for _ in normalized_ids)
+        skipped_not_found_total = 0
+        campaign_id = None
+        with db() as conn:
+            existing_rows = conn.execute(
+                f"select id from customers where id in ({placeholders})",
+                normalized_ids,
+            ).fetchall()
+            existing_ids = {int(row["id"]) for row in existing_rows}
+            valid_ids = [customer_id for customer_id in normalized_ids if customer_id in existing_ids]
+            skipped_not_found_total = len(normalized_ids) - len(valid_ids)
+            if not valid_ids:
+                self.send_json({"error": "Nenhum cliente valido foi informado"}, HTTPStatus.BAD_REQUEST)
+                return
+            campaign_cursor = conn.execute(
+                """
+                insert into campaigns (name, body, status, created_by_user_id, scheduled_at, rate_per_minute, created_at, started_at)
+                values (?, ?, 'pending', ?, ?, ?, ?, ?)
+                """,
+                (name, body, user["id"], scheduled_at, rate_per_minute, now, now),
+            )
+            campaign_id = campaign_cursor.lastrowid
+            conn.executemany(
+                """
+                insert into campaign_targets (campaign_id, customer_id, status)
+                values (?, ?, 'queued')
+                """,
+                [(campaign_id, customer_id) for customer_id in valid_ids],
+            )
+        if scheduled_at is None or scheduled_at <= now:
+            process_pending_campaign_dispatches(limit_campaigns=3)
+        with db() as conn:
+            row = conn.execute(
+                """
+                select
+                    c.id,
+                    c.status,
+                    c.scheduled_at,
+                    c.rate_per_minute,
+                    count(ct.id) total_targets,
+                    sum(case when ct.status = 'queued' then 1 else 0 end) queued_total,
+                    sum(case when ct.status = 'sent' then 1 else 0 end) sent_total,
+                    sum(case when ct.status = 'failed' then 1 else 0 end) failed_total
+                from campaigns c
+                left join campaign_targets ct on ct.campaign_id = c.id
+                where c.id = ?
+                group by c.id, c.status, c.scheduled_at, c.rate_per_minute
+                """,
+                (campaign_id,),
+            ).fetchone()
+        log_action(
+            user["id"],
+            "campaign.created",
+            {
+                "campaign_id": campaign_id,
+                "total_targets": int(row["total_targets"] or 0),
+                "queued_total": int(row["queued_total"] or 0),
+                "sent_total": int(row["sent_total"] or 0),
+                "failed_total": int(row["failed_total"] or 0),
+                "skipped_not_found_total": skipped_not_found_total,
+                "scheduled_at": scheduled_at,
+                "rate_per_minute": rate_per_minute,
+            },
+        )
+        self.send_json(
+            {
+                "ok": True,
+                "campaign_id": campaign_id,
+                "status": row["status"],
+                "scheduled_at": row["scheduled_at"],
+                "rate_per_minute": int(row["rate_per_minute"] or 0),
+                "total_targets": int(row["total_targets"] or 0),
+                "queued_total": int(row["queued_total"] or 0),
+                "sent_total": int(row["sent_total"] or 0),
+                "failed_total": int(row["failed_total"] or 0),
+                "skipped_not_found_total": skipped_not_found_total,
+            },
+            HTTPStatus.CREATED,
+        )
+
+    def api_export_campaign_csv(self, campaign_id):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode exportar campanhas"}, HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            campaign = conn.execute(
+                "select id, name, status, scheduled_at, rate_per_minute from campaigns where id = ?",
+                (campaign_id,),
+            ).fetchone()
+            if not campaign:
+                self.send_json({"error": "Campanha nao encontrada"}, HTTPStatus.NOT_FOUND)
+                return
+            rows = conn.execute(
+                """
+                select
+                    ct.id target_id,
+                    ct.customer_id,
+                    coalesce(c.name, '') customer_name,
+                    coalesce(c.phone, '') customer_phone,
+                    ct.status,
+                    coalesce(ct.last_error, '') last_error,
+                    ct.sent_at
+                from campaign_targets ct
+                left join customers c on c.id = ct.customer_id
+                where ct.campaign_id = ?
+                order by ct.id asc
+                """,
+                (campaign_id,),
+            ).fetchall()
+        output = io.StringIO()
+        output.write("\ufeff")
+        writer = csv.writer(output)
+        writer.writerow(
+            [
+                "campaign_id",
+                "campaign_name",
+                "campaign_status",
+                "scheduled_at",
+                "rate_per_minute",
+                "target_id",
+                "customer_id",
+                "customer_name",
+                "customer_phone",
+                "target_status",
+                "last_error",
+                "sent_at",
+            ]
+        )
+        for row in rows:
+            writer.writerow(
+                [
+                    campaign["id"],
+                    campaign["name"],
+                    campaign["status"],
+                    campaign["scheduled_at"] or "",
+                    campaign["rate_per_minute"],
+                    row["target_id"],
+                    row["customer_id"],
+                    row["customer_name"],
+                    row["customer_phone"],
+                    row["status"],
+                    row["last_error"],
+                    row["sent_at"] or "",
+                ]
+            )
+        body = output.getvalue().encode("utf-8")
+        filename = f"campaign-{campaign_id}.csv"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("X-Request-ID", self.request_id)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_outbound_for_customer(self, conn, customer_id, text):
+        customer = conn.execute("select id, phone from customers where id = ?", (customer_id,)).fetchone()
+        if not customer:
+            raise APIError(HTTPStatus.NOT_FOUND, "Cliente nao encontrado")
+        external_id = None
+        status = "sent"
+        try:
+            status, external_id = dispatch_outbound_text(customer["phone"], text)
+        except RuntimeError as exc:
+            status = f"local: {exc}"
+        send_ts = now_ts()
+        conn.execute(
+            "insert into messages (customer_id, direction, body, status, external_id, created_at) values (?, ?, ?, ?, ?, ?)",
+            (customer_id, "outbound", text, status, external_id, send_ts),
+        )
+        conn.execute(
+            "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
+            (send_ts, send_ts, customer_id),
+        )
+        return status
+
+    def api_send_quick_reply(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "quick_reply:send"):
+            self.send_json({"error": "Sem permissao quick_reply:send"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        if self.customer_is_finalized(customer_id):
+            self.send_json({"error": "Atendimento finalizado. Novas aÃ§Ãµes estÃ£o bloqueadas."}, HTTPStatus.CONFLICT)
+            return
+        payload = self.read_json()
+        shortcut = str(payload.get("shortcut") or "").strip()
+        if not shortcut:
+            self.send_json({"error": "shortcut Ã© obrigatÃ³rio"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            row = conn.execute(
+                "select body from quick_replies where shortcut = ?",
+                (shortcut,),
+            ).fetchone()
+            if not row:
+                self.send_json({"error": "Frase rÃ¡pida nÃ£o encontrada"}, HTTPStatus.NOT_FOUND)
+                return
+            status = self._send_outbound_for_customer(conn, customer_id, row["body"])
+        log_action(user["id"], "quick_reply.sent", {"customer_id": customer_id, "shortcut": shortcut})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "quick_reply_sent", "shortcut": shortcut, "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
+        self.send_json({"ok": True, "status": status})
+
+    def api_private_notes(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        with db() as conn:
+            rows = conn.execute(
+                """
+                select n.id, n.customer_id, n.user_id, n.body, n.created_at, coalesce(u.name, 'UsuÃ¡rio') user_name
+                from private_notes n
+                left join users u on u.id = n.user_id
+                where n.customer_id = ?
+                order by n.created_at desc, n.id desc
+                """,
+                (customer_id,),
+            ).fetchall()
+        self.send_json({"notes": [dict(row) for row in rows]})
+
+    def api_add_private_note(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "notes:write"):
+            self.send_json({"error": "Sem permissao notes:write"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        payload = self.read_json()
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            self.send_json({"error": "Nota vazia"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(body) > 4096:
+            self.send_json({"error": "Nota excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            conn.execute(
+                "insert into private_notes (customer_id, user_id, body, created_at) values (?, ?, ?, ?)",
+                (customer_id, user["id"], body, now_ts()),
+            )
+        log_action(user["id"], "private_note.added", {"customer_id": customer_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "private_note_added", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
+        self.send_json({"ok": True})
+
+    def api_scheduled_messages(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        with db() as conn:
+            rows = conn.execute(
+                """
+                select s.*, coalesce(u.name, 'UsuÃ¡rio') created_by_name
+                from scheduled_messages s
+                left join users u on u.id = s.created_by_user_id
+                where s.customer_id = ?
+                order by s.send_at desc, s.id desc
+                """,
+                (customer_id,),
+            ).fetchall()
+        self.send_json({"scheduled_messages": [dict(row) for row in rows]})
+
+    def api_schedule_message(self, customer_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "schedule:manage"):
+            self.send_json({"error": "Sem permissao schedule:manage"}, HTTPStatus.FORBIDDEN)
+            return
+        if not self.require_customer_access(user, customer_id):
+            return
+        if self.customer_is_finalized(customer_id):
+            self.send_json({"error": "Atendimento finalizado. Novas aÃ§Ãµes estÃ£o bloqueadas."}, HTTPStatus.CONFLICT)
+            return
+        payload = self.read_json()
+        body = str(payload.get("body") or "").strip()
+        if not body:
+            self.send_json({"error": "Mensagem agendada vazia"}, HTTPStatus.BAD_REQUEST)
+            return
+        if len(body) > 4096:
+            self.send_json({"error": "Mensagem excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            send_at = int(payload.get("send_at") or 0)
+        except (TypeError, ValueError):
+            self.send_json({"error": "send_at invÃ¡lido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if send_at <= 0:
+            self.send_json({"error": "send_at invÃ¡lido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if send_at > now_ts() + (365 * 86400):
+            self.send_json({"error": "send_at excede o limite de 365 dias"}, HTTPStatus.BAD_REQUEST)
+            return
+        with db() as conn:
+            customer = conn.execute("select id from customers where id = ?", (customer_id,)).fetchone()
+            if not customer:
+                self.send_json({"error": "Cliente nao encontrado"}, HTTPStatus.NOT_FOUND)
+                return
+            cursor = conn.execute(
+                """
+                insert into scheduled_messages
+                (customer_id, body, send_at, status, created_by_user_id, created_at)
+                values (?, ?, ?, 'pending', ?, ?)
+                """,
+                (customer_id, body, send_at, user["id"], now_ts()),
+            )
+        log_action(user["id"], "scheduled_message.created", {"customer_id": customer_id, "scheduled_message_id": cursor.lastrowid})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": customer_id, "kind": "scheduled_message_created", "by_user_id": user["id"]},
+            customer_id=customer_id,
+        )
+        self.send_json({"ok": True, "id": cursor.lastrowid}, HTTPStatus.CREATED)
+
+    def api_cancel_scheduled_message(self, scheduled_message_id):
+        user = self.require_user()
+        if not user:
+            return
+        if not user_has_permission(user, "schedule:manage"):
+            self.send_json({"error": "Sem permissao schedule:manage"}, HTTPStatus.FORBIDDEN)
+            return
+        with db() as conn:
+            row = conn.execute(
+                "select id, customer_id, status from scheduled_messages where id = ?",
+                (scheduled_message_id,),
+            ).fetchone()
+            if not row:
+                self.send_json({"error": "Agendamento nÃ£o encontrado"}, HTTPStatus.NOT_FOUND)
+                return
+        if not self.require_customer_access(user, row["customer_id"]):
+            return
+        if row["status"] != "pending":
+            self.send_json({"error": "Somente agendamentos pendentes podem ser cancelados"}, HTTPStatus.CONFLICT)
+            return
+        with db() as conn:
+            conn.execute(
+                "update scheduled_messages set status = 'cancelled', sent_at = ?, last_error = ? where id = ? and status = 'pending'",
+                (now_ts(), "cancelled_by_user", scheduled_message_id),
+            )
+        log_action(user["id"], "scheduled_message.cancelled", {"scheduled_message_id": scheduled_message_id})
+        publish_realtime_event(
+            "ticket.updated",
+            {"customer_id": row["customer_id"], "kind": "scheduled_message_cancelled", "by_user_id": user["id"]},
+            customer_id=row["customer_id"],
+        )
+        self.send_json({"ok": True})
+
     def api_send_message(self, customer_id):
         user = self.require_user()
         if not user:
@@ -1257,26 +2726,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Mensagem excede o limite de 4096 caracteres"}, HTTPStatus.BAD_REQUEST)
             return
         with db() as conn:
-            customer = conn.execute("select * from customers where id = ?", (customer_id,)).fetchone()
-            if not customer:
-                self.send_json({"error": "Cliente nao encontrado"}, HTTPStatus.NOT_FOUND)
-                return
-            external_id = None
-            status = "sent"
-            try:
-                if evolution.configured():
-                    response = evolution.send_text(customer["phone"], text)
-                    external_id = str(response.get("key", {}).get("id") or response.get("messageId") or "")
-            except RuntimeError as exc:
-                status = f"local: {exc}"
-            conn.execute(
-                "insert into messages (customer_id, direction, body, status, external_id, created_at) values (?, ?, ?, ?, ?, ?)",
-                (customer_id, "outbound", text, status, external_id, now_ts()),
-            )
-            conn.execute(
-                "update customers set last_message_at = ?, first_response_at = coalesce(first_response_at, ?) where id = ?",
-                (now_ts(), now_ts(), customer_id),
-            )
+            status = self._send_outbound_for_customer(conn, customer_id, text)
         log_action(user["id"], "message.sent", {"customer_id": customer_id})
         publish_realtime_event(
             "ticket.updated",
@@ -1600,11 +3050,6 @@ class Handler(BaseHTTPRequestHandler):
         clause, params = self.visible_customer_clause(user)
         now = now_ts()
 
-        def _normalize_avg(value):
-            if value is None:
-                return 0
-            return int(round(value))
-
         with db() as conn:
             summary = conn.execute(
                 f"""
@@ -1652,17 +3097,371 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchall()
 
         payload_summary = dict(summary)
-        payload_summary["avg_first_response_seconds"] = _normalize_avg(payload_summary["avg_first_response_seconds"])
-        payload_summary["avg_resolution_seconds"] = _normalize_avg(payload_summary["avg_resolution_seconds"])
+        payload_summary["avg_first_response_seconds"] = normalize_avg_seconds(payload_summary["avg_first_response_seconds"])
+        payload_summary["avg_resolution_seconds"] = normalize_avg_seconds(payload_summary["avg_resolution_seconds"])
 
         by_queue = []
         for row in queue_rows:
             item = dict(row)
-            item["avg_first_response_seconds"] = _normalize_avg(item["avg_first_response_seconds"])
-            item["avg_resolution_seconds"] = _normalize_avg(item["avg_resolution_seconds"])
+            item["avg_first_response_seconds"] = normalize_avg_seconds(item["avg_first_response_seconds"])
+            item["avg_resolution_seconds"] = normalize_avg_seconds(item["avg_resolution_seconds"])
             by_queue.append(item)
 
         self.send_json({"sla": payload_summary, "by_queue": by_queue, "now": now})
+
+    def _parse_window_days(self, parsed, default_days=30):
+        query = parse_qs(parsed.query)
+        raw_days = query.get("days", [str(default_days)])[0]
+        try:
+            days = int(raw_days)
+        except (TypeError, ValueError):
+            raise APIError(HTTPStatus.BAD_REQUEST, "Parametro days invalido")
+        if days < 1 or days > 90:
+            raise APIError(HTTPStatus.BAD_REQUEST, "Parametro days deve estar entre 1 e 90")
+        return days
+
+    def _parse_target_seconds(self, raw_value, label, minimum_seconds, maximum_seconds):
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            raise APIError(HTTPStatus.BAD_REQUEST, f"{label} invalido")
+        if value < minimum_seconds or value > maximum_seconds:
+            raise APIError(
+                HTTPStatus.BAD_REQUEST,
+                f"{label} deve estar entre {minimum_seconds} e {maximum_seconds} segundos",
+            )
+        return value
+
+    def _build_tma_tme_targets_payload(self, conn):
+        global_target, by_queue_targets = load_tma_tme_targets(conn)
+        queue_rows = conn.execute("select id, name from queues order by name asc").fetchall()
+        queue_payload = []
+        for row in queue_rows:
+            queue_id = int(row["id"])
+            custom_target = by_queue_targets.get(queue_id)
+            effective_target = custom_target or global_target
+            queue_payload.append(
+                {
+                    "queue_id": queue_id,
+                    "queue_name": row["name"],
+                    "tme_target_seconds": int(effective_target["tme_target_seconds"]),
+                    "tma_target_seconds": int(effective_target["tma_target_seconds"]),
+                    "has_custom_target": bool(custom_target),
+                    "updated_at": custom_target["updated_at"] if custom_target else global_target["updated_at"],
+                }
+            )
+        return {"global": global_target, "queues": queue_payload}
+
+    def api_tma_tme_targets(self):
+        user = self.require_user()
+        if not user:
+            return
+        with db() as conn:
+            payload = self._build_tma_tme_targets_payload(conn)
+        self.send_json({"targets": payload, "generated_at": now_ts()})
+
+    def api_update_tma_tme_targets(self):
+        user = self.require_user()
+        if not user:
+            return
+        if user["role"] != "admin":
+            self.send_json({"error": "Somente admin pode atualizar metas TMA/TME"}, HTTPStatus.FORBIDDEN)
+            return
+
+        payload = self.read_json()
+        global_payload = payload.get("global")
+        queue_payload = payload.get("queues", [])
+        if global_payload is not None and not isinstance(global_payload, dict):
+            self.send_json({"error": "Campo global invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+        if not isinstance(queue_payload, list):
+            self.send_json({"error": "Campo queues invalido"}, HTTPStatus.BAD_REQUEST)
+            return
+
+        with db() as conn:
+            existing_queue_ids = {
+                int(row["id"]) for row in conn.execute("select id from queues").fetchall()
+            }
+            if global_payload is not None:
+                tme_global = self._parse_target_seconds(
+                    global_payload.get("tme_target_seconds"),
+                    "TME global",
+                    30,
+                    86400,
+                )
+                tma_global = self._parse_target_seconds(
+                    global_payload.get("tma_target_seconds"),
+                    "TMA global",
+                    60,
+                    172800,
+                )
+                conn.execute(
+                    """
+                    insert into tma_tme_targets (queue_id, tme_target_seconds, tma_target_seconds, updated_at)
+                    values (0, ?, ?, ?)
+                    on conflict(queue_id) do update set
+                        tme_target_seconds = excluded.tme_target_seconds,
+                        tma_target_seconds = excluded.tma_target_seconds,
+                        updated_at = excluded.updated_at
+                    """,
+                    (tme_global, tma_global, now_ts()),
+                )
+
+            for item in queue_payload:
+                if not isinstance(item, dict):
+                    self.send_json({"error": "Item de queue invalido"}, HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    queue_id = int(item.get("queue_id") or 0)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "queue_id invalido"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if queue_id <= 0 or queue_id not in existing_queue_ids:
+                    self.send_json({"error": f"Fila invalida para queue_id={queue_id}"}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                if bool(item.get("inherit")):
+                    conn.execute("delete from tma_tme_targets where queue_id = ?", (queue_id,))
+                    continue
+
+                tme_queue = self._parse_target_seconds(
+                    item.get("tme_target_seconds"),
+                    "TME da fila",
+                    30,
+                    86400,
+                )
+                tma_queue = self._parse_target_seconds(
+                    item.get("tma_target_seconds"),
+                    "TMA da fila",
+                    60,
+                    172800,
+                )
+                conn.execute(
+                    """
+                    insert into tma_tme_targets (queue_id, tme_target_seconds, tma_target_seconds, updated_at)
+                    values (?, ?, ?, ?)
+                    on conflict(queue_id) do update set
+                        tme_target_seconds = excluded.tme_target_seconds,
+                        tma_target_seconds = excluded.tma_target_seconds,
+                        updated_at = excluded.updated_at
+                    """,
+                    (queue_id, tme_queue, tma_queue, now_ts()),
+                )
+
+            result = self._build_tma_tme_targets_payload(conn)
+        log_action(user["id"], "tma_tme.targets_updated", {"updated_queues": len(queue_payload)})
+        self.send_json({"ok": True, "targets": result, "updated_at": now_ts()})
+
+    def api_tma_tme(self, parsed):
+        user = self.require_user()
+        if not user:
+            return
+        days = self._parse_window_days(parsed)
+        now = now_ts()
+        window_start = now - (days * 86400)
+        clause, base_params = self.visible_customer_clause(user, alias="c")
+        where_sql = f"{clause} and c.created_at >= ?"
+        params = [*base_params, window_start]
+
+        with db() as conn:
+            targets_payload = self._build_tma_tme_targets_payload(conn)
+            summary = conn.execute(
+                f"""
+                with global_target as (
+                    select
+                        coalesce((select tme_target_seconds from tma_tme_targets where queue_id = 0), ?) as tme_target_seconds,
+                        coalesce((select tma_target_seconds from tma_tme_targets where queue_id = 0), ?) as tma_target_seconds
+                )
+                select
+                    count(*) total,
+                    sum(case when c.first_response_at is not null then 1 else 0 end) answered_tickets,
+                    sum(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then 1
+                            else 0
+                        end
+                    ) handled_tickets,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_tme_seconds,
+                    avg(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then c.closed_at - c.first_response_at
+                            else null
+                        end
+                    ) avg_tma_seconds,
+                    sum(
+                        case
+                            when c.first_response_at is not null
+                                 and c.first_response_at - c.created_at <= coalesce(tq.tme_target_seconds, gt.tme_target_seconds)
+                            then 1
+                            else 0
+                        end
+                    ) tme_within_target,
+                    sum(
+                        case
+                            when c.first_response_at is not null
+                                 and c.closed_at is not null
+                                 and c.closed_at >= c.first_response_at
+                                 and c.closed_at - c.first_response_at <= coalesce(tq.tma_target_seconds, gt.tma_target_seconds)
+                            then 1
+                            else 0
+                        end
+                    ) tma_within_target
+                from customers c
+                left join tma_tme_targets tq on tq.queue_id = c.queue_id
+                cross join global_target gt
+                where {where_sql}
+                """,
+                [DEFAULT_TME_TARGET_SECONDS, DEFAULT_TMA_TARGET_SECONDS, *params],
+            ).fetchone()
+
+            queue_rows = conn.execute(
+                f"""
+                with global_target as (
+                    select
+                        coalesce((select tme_target_seconds from tma_tme_targets where queue_id = 0), ?) as tme_target_seconds,
+                        coalesce((select tma_target_seconds from tma_tme_targets where queue_id = 0), ?) as tma_target_seconds
+                )
+                select
+                    q.id queue_id,
+                    q.name queue_name,
+                    count(*) total,
+                    sum(case when c.first_response_at is not null then 1 else 0 end) answered_tickets,
+                    sum(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then 1
+                            else 0
+                        end
+                    ) handled_tickets,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_tme_seconds,
+                    avg(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then c.closed_at - c.first_response_at
+                            else null
+                        end
+                    ) avg_tma_seconds,
+                    sum(
+                        case
+                            when c.first_response_at is not null
+                                 and c.first_response_at - c.created_at <= coalesce(tq.tme_target_seconds, gt.tme_target_seconds)
+                            then 1
+                            else 0
+                        end
+                    ) tme_within_target,
+                    sum(
+                        case
+                            when c.first_response_at is not null
+                                 and c.closed_at is not null
+                                 and c.closed_at >= c.first_response_at
+                                 and c.closed_at - c.first_response_at <= coalesce(tq.tma_target_seconds, gt.tma_target_seconds)
+                            then 1
+                            else 0
+                        end
+                    ) tma_within_target,
+                    coalesce(tq.tme_target_seconds, gt.tme_target_seconds) tme_target_seconds,
+                    coalesce(tq.tma_target_seconds, gt.tma_target_seconds) tma_target_seconds
+                from customers c
+                join queues q on q.id = c.queue_id
+                left join tma_tme_targets tq on tq.queue_id = q.id
+                cross join global_target gt
+                where {where_sql}
+                group by
+                    q.id,
+                    q.name,
+                    coalesce(tq.tme_target_seconds, gt.tme_target_seconds),
+                    coalesce(tq.tma_target_seconds, gt.tma_target_seconds)
+                order by q.name asc
+                """,
+                [DEFAULT_TME_TARGET_SECONDS, DEFAULT_TMA_TARGET_SECONDS, *params],
+            ).fetchall()
+
+            operator_rows = conn.execute(
+                f"""
+                select
+                    coalesce(u.name, 'Sem operador') operator_name,
+                    count(*) total,
+                    sum(case when c.first_response_at is not null then 1 else 0 end) answered_tickets,
+                    sum(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then 1
+                            else 0
+                        end
+                    ) handled_tickets,
+                    avg(case when c.first_response_at is not null then c.first_response_at - c.created_at end) avg_tme_seconds,
+                    avg(
+                        case
+                            when c.first_response_at is not null and c.closed_at is not null and c.closed_at >= c.first_response_at
+                            then c.closed_at - c.first_response_at
+                            else null
+                        end
+                    ) avg_tma_seconds
+                from customers c
+                left join users u on u.id = c.assigned_operator_id
+                where {where_sql}
+                group by u.id, u.name
+                order by handled_tickets desc, answered_tickets desc, operator_name asc
+                """,
+                params,
+            ).fetchall()
+
+        summary_payload = dict(summary)
+        summary_payload["total"] = int(summary_payload.get("total") or 0)
+        summary_payload["answered_tickets"] = int(summary_payload.get("answered_tickets") or 0)
+        summary_payload["handled_tickets"] = int(summary_payload.get("handled_tickets") or 0)
+        summary_payload["tme_within_target"] = int(summary_payload.get("tme_within_target") or 0)
+        summary_payload["tma_within_target"] = int(summary_payload.get("tma_within_target") or 0)
+        summary_payload["avg_tme_seconds"] = normalize_avg_seconds(summary_payload.get("avg_tme_seconds"))
+        summary_payload["avg_tma_seconds"] = normalize_avg_seconds(summary_payload.get("avg_tma_seconds"))
+        summary_payload["tme_compliance_percent"] = percentage(
+            summary_payload["tme_within_target"], summary_payload["answered_tickets"]
+        )
+        summary_payload["tma_compliance_percent"] = percentage(
+            summary_payload["tma_within_target"], summary_payload["handled_tickets"]
+        )
+        summary_payload["target_tme_seconds"] = int(targets_payload["global"]["tme_target_seconds"])
+        summary_payload["target_tma_seconds"] = int(targets_payload["global"]["tma_target_seconds"])
+
+        by_queue = []
+        for row in queue_rows:
+            item = dict(row)
+            item["total"] = int(item.get("total") or 0)
+            item["answered_tickets"] = int(item.get("answered_tickets") or 0)
+            item["handled_tickets"] = int(item.get("handled_tickets") or 0)
+            item["tme_within_target"] = int(item.get("tme_within_target") or 0)
+            item["tma_within_target"] = int(item.get("tma_within_target") or 0)
+            item["tme_target_seconds"] = int(item.get("tme_target_seconds") or 0)
+            item["tma_target_seconds"] = int(item.get("tma_target_seconds") or 0)
+            item["avg_tme_seconds"] = normalize_avg_seconds(item.get("avg_tme_seconds"))
+            item["avg_tma_seconds"] = normalize_avg_seconds(item.get("avg_tma_seconds"))
+            item["tme_compliance_percent"] = percentage(item["tme_within_target"], item["answered_tickets"])
+            item["tma_compliance_percent"] = percentage(item["tma_within_target"], item["handled_tickets"])
+            by_queue.append(item)
+
+        by_operator = []
+        for row in operator_rows:
+            item = dict(row)
+            item["total"] = int(item.get("total") or 0)
+            item["answered_tickets"] = int(item.get("answered_tickets") or 0)
+            item["handled_tickets"] = int(item.get("handled_tickets") or 0)
+            item["avg_tme_seconds"] = normalize_avg_seconds(item.get("avg_tme_seconds"))
+            item["avg_tma_seconds"] = normalize_avg_seconds(item.get("avg_tma_seconds"))
+            by_operator.append(item)
+
+        self.send_json(
+            {
+                "summary": summary_payload,
+                "by_queue": by_queue,
+                "by_operator": by_operator,
+                "targets": targets_payload,
+                "window_days": days,
+                "window_start": window_start,
+                "generated_at": now,
+            }
+        )
 
     def api_dashboard_intelligence(self):
         user = self.require_user()
@@ -1967,6 +3766,8 @@ def main():
     init_db()
     worker = threading.Thread(target=webhook_worker, daemon=True, name="webhook-worker")
     worker.start()
+    scheduler = threading.Thread(target=scheduled_messages_worker, daemon=True, name="scheduled-worker")
+    scheduler.start()
     port = int(os.environ.get("PORT", "8000"))
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"Omnichannel rodando em http://127.0.0.1:{port}")

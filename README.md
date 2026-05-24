@@ -78,6 +78,19 @@ Recomendacao: altere a senha padrao apos o primeiro login.
 - Atualizacao em tempo real via SSE em `GET /api/events`.
 - SLA operacional em `GET /api/sla` (resumo + visao por fila).
 - Dashboard inteligente em `GET /api/dashboard/intelligence` (score, alertas, carga por fila e operadores).
+- Gestao de TMA/TME em `GET /api/tma-tme` (resumo, conformidade, visao por fila e operador).
+- Metas de TMA/TME por fila em `GET/POST /api/tma-tme/targets` (admin).
+- Frases rapidas via API (`GET/POST /api/quick-replies`) e envio por conversa (`POST /api/customers/{id}/quick-reply`).
+- Notas privadas por cliente (`GET/POST /api/customers/{id}/notes`).
+- Agendamento de mensagens por cliente (`POST /api/customers/{id}/schedule-message`) com worker dedicado.
+- Listagem e cancelamento de agendamentos (`GET /api/customers/{id}/scheduled-messages`, `POST /api/scheduled-messages/{id}/cancel`).
+- Midias por atendimento (`GET/POST /api/customers/{id}/media`) com registro no historico.
+- Upload de midia por arquivo base64 (`POST /api/customers/{id}/media-upload`) com publicacao local em `/uploads/*`.
+- Chat interno da equipe (`GET/POST /api/team-messages`).
+- Sugestao de resposta por IA (`POST /api/customers/{id}/ai-suggest`) com fallback local quando OpenAI nao estiver configurada.
+- Opt-out de campanhas por cliente (`POST /api/customers/{id}/campaign-opt-out`, admin).
+- Campanhas em massa com fila, agendamento e taxa (`GET/POST /api/campaigns`).
+- Exportacao CSV de campanha (`GET /api/campaigns/{id}/export`).
 
 ## Integracao completa com ERPs
 
@@ -139,5 +152,11 @@ Variaveis de ambiente uteis:
 - `WEBHOOK_PROCESSED_RETENTION_SECONDS`: retencao de eventos processados em segundos (default `604800`)
 - `WEBHOOK_MAX_ATTEMPTS`: maximo de tentativas de processamento antes de dead-letter logico (default `5`)
 - `DEFAULT_SLA_FIRST_RESPONSE_SECONDS`: alvo de SLA para 1a resposta (default `900`)
+- `DEFAULT_TME_TARGET_SECONDS`: meta global inicial de TME em segundos (default `300`)
+- `DEFAULT_TMA_TARGET_SECONDS`: meta global inicial de TMA em segundos (default `1200`)
+- `SCHEDULE_WORKER_POLL_SECONDS`: intervalo de varredura do worker de agendamento (default `2`)
+- `MAX_UPLOAD_BYTES`: tamanho maximo para upload de arquivo em bytes (default `10485760`)
+- `OPENAI_API_KEY`: chave para endpoint de sugestao IA
+- `OPENAI_MODEL`: modelo OpenAI para sugestoes (default `gpt-5-mini`)
 - `SSE_KEEPALIVE_SECONDS`: intervalo de keepalive SSE (default `15`)
 - `SSE_SUBSCRIBER_QUEUE_MAX`: backlog maximo por assinante SSE (default `200`)
