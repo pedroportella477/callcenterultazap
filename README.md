@@ -3,6 +3,15 @@ Sistema de atendimento via whatsapp
 
 Sistema de atendimento via WhatsApp com regras de negocio centrais implementadas.
 
+## Canais omnichannel suportados
+
+- WhatsApp
+- Telegram
+- Instagram
+- Facebook Messenger
+- E-mail
+- Chat para site
+
 ## Funcionalidades implementadas
 
 - Cadastro de contatos com normalizacao de telefone.
@@ -62,6 +71,7 @@ Recomendacao: altere a senha padrao apos o primeiro login.
 ## Webhook e observabilidade
 
 - Endpoint dedicado para webhook WhatsApp: `/api/webhook/evolution`.
+- Endpoint unificado para inbound omnichannel: `POST /api/webhook/inbound`.
 - Validacao por token opcional via header `X-Webhook-Token` com `WEBHOOK_TOKEN`.
 - Idempotencia por `event_key` persistida em SQLite (`webhook_events`).
 - Fila em memoria + worker para processamento assinc.

@@ -57,12 +57,21 @@
             <h2>Conversas</h2>
           </div>
           <div class="top-actions">
-            <input id="search-input" type="search" placeholder="Buscar cliente ou telefone">
+            <input id="search-input" type="search" placeholder="Buscar cliente ou contato">
             <select id="status-filter">
               <option value="">Todos</option>
               <option value="open">Abertos</option>
               <option value="pending">Pendentes</option>
               <option value="closed">Fechados</option>
+            </select>
+            <select id="channel-filter">
+              <option value="">Todos os canais</option>
+              <option value="whatsapp">WhatsApp</option>
+              <option value="telegram">Telegram</option>
+              <option value="instagram">Instagram</option>
+              <option value="facebook_messenger">Facebook Messenger</option>
+              <option value="email">E-mail</option>
+              <option value="webchat">Chat do site</option>
             </select>
             <button id="new-customer-button" type="button">Novo cliente</button>
           </div>
@@ -218,7 +227,8 @@
               <thead>
                 <tr>
                   <th>Cliente</th>
-                  <th>Telefone</th>
+                  <th>Contato</th>
+                  <th>Canal</th>
                   <th>Fila</th>
                   <th>Operador</th>
                   <th>Status</th>
@@ -474,7 +484,18 @@
       <form id="customer-form" method="dialog" class="form-grid">
         <h3>Novo cliente</h3>
         <label>Nome <input name="name" required></label>
-        <label>Telefone <input name="phone" placeholder="5511999999999" required></label>
+        <label>
+          Canal
+          <select name="channel" required>
+            <option value="whatsapp">WhatsApp</option>
+            <option value="telegram">Telegram</option>
+            <option value="instagram">Instagram</option>
+            <option value="facebook_messenger">Facebook Messenger</option>
+            <option value="email">E-mail</option>
+            <option value="webchat">Chat do site</option>
+          </select>
+        </label>
+        <label>Contato <input name="contact" placeholder="5511999999999 / @usuario / email@dominio.com" required></label>
         <label>Fila <select name="queue_id" required></select></label>
         <label class="admin-only hidden">Operador <select name="assigned_operator_id"></select></label>
         <div class="button-row">

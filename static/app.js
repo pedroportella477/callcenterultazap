@@ -65,6 +65,19 @@ function statusLabel(status) {
   return { open: "Aberto", pending: "Pendente", closed: "Fechado" }[status] || status;
 }
 
+function channelLabel(channel) {
+  return (
+    {
+      whatsapp: "WhatsApp",
+      telegram: "Telegram",
+      instagram: "Instagram",
+      facebook_messenger: "Facebook Messenger",
+      email: "E-mail",
+      webchat: "Chat do site",
+    }[channel] || channel || "Canal"
+  );
+}
+
 async function bootstrap() {
   const me = await api("/api/me");
   if (!me.user) {
@@ -349,7 +362,10 @@ function renderCampaignCustomerOptions() {
     return;
   }
   select.innerHTML = customers
-    .map((customer) => `<option value="${customer.id}">${escapeHtml(customer.name)} (${escapeHtml(customer.phone)})</option>`)
+    .map(
+      (customer) =>
+        `<option value="${customer.id}">${escapeHtml(customer.name)} (${escapeHtml(channelLabel(customer.channel))}: ${escapeHtml(customer.contact || customer.phone)})</option>`
+    )
     .join("");
 }
 
@@ -579,8 +595,10 @@ async function loadCustomers() {
   const params = new URLSearchParams();
   const q = $("#search-input").value.trim();
   const status = $("#status-filter").value;
+  const channel = $("#channel-filter")?.value || "";
   if (q) params.set("q", q);
   if (status) params.set("status", status);
+  if (channel) params.set("channel", channel);
   const { customers } = await api(`/api/customers?${params.toString()}`);
   state.customers = customers;
   renderCampaignCustomerOptions();
@@ -656,7 +674,7 @@ function renderCustomerList() {
           <strong>${escapeHtml(customer.name)}</strong>
           <span class="status-pill">${statusLabel(customer.status)}${customer.finalized ? " (finalizado)" : ""}</span>
         </div>
-        <small class="muted">${escapeHtml(customer.phone)} - ${escapeHtml(customer.queue_name)}</small>
+        <small class="muted">${escapeHtml(channelLabel(customer.channel))} - ${escapeHtml(customer.contact || customer.phone)} - ${escapeHtml(customer.queue_name)}</small>
         <small class="muted">${escapeHtml(customer.operator_name || "Sem operador")} - ${formatDate(customer.last_message_at)}</small>
       </article>`
     )
@@ -670,7 +688,8 @@ function renderCustomerTable() {
       (c) => `
       <tr>
         <td><strong>${escapeHtml(c.name)}</strong></td>
-        <td>${escapeHtml(c.phone)}</td>
+        <td>${escapeHtml(c.contact || c.phone)}</td>
+        <td>${escapeHtml(channelLabel(c.channel))}</td>
         <td>${escapeHtml(c.queue_name)}</td>
         <td>${escapeHtml(c.operator_name || "Sem operador")}</td>
         <td>${statusLabel(c.status)}${c.finalized ? " / finalizado" : ""}</td>
@@ -687,7 +706,7 @@ async function selectCustomer(id) {
   $("#chat-empty").classList.add("hidden");
   $("#chat-content").classList.remove("hidden");
   $("#chat-name").textContent = customer.name;
-  $("#chat-meta").textContent = `${customer.phone} - ${customer.queue_name} - ${customer.operator_name || "Sem operador"}`;
+  $("#chat-meta").textContent = `${channelLabel(customer.channel)} - ${customer.contact || customer.phone} - ${customer.queue_name} - ${customer.operator_name || "Sem operador"}`;
   $("#customer-status").value = customer.status;
   $("#message-form button[type='submit']").disabled = !!customer.finalized;
   $("#message-form textarea[name='body']").disabled = !!customer.finalized;
@@ -842,12 +861,29 @@ $("#search-input").addEventListener("input", () => {
   loadCustomers.timer = window.setTimeout(loadCustomers, 250);
 });
 $("#status-filter").addEventListener("change", loadCustomers);
+$("#channel-filter").addEventListener("change", loadCustomers);
 $("#tma-tme-window").addEventListener("change", () => {
   loadTmaTme().catch((error) => toast(error.message));
 });
 
 $("#new-customer-button").addEventListener("click", () => $("#customer-dialog").showModal());
 $("#cancel-customer-button").addEventListener("click", () => $("#customer-dialog").close());
+
+const customerChannelSelect = $("#customer-form select[name='channel']");
+const customerContactInput = $("#customer-form input[name='contact']");
+if (customerChannelSelect && customerContactInput) {
+  const placeholders = {
+    whatsapp: "5511999999999",
+    telegram: "@usuario_telegram",
+    instagram: "@perfil_instagram",
+    facebook_messenger: "id_ou_usuario",
+    email: "cliente@dominio.com",
+    webchat: "sessao-chat-12345",
+  };
+  customerChannelSelect.addEventListener("change", () => {
+    customerContactInput.placeholder = placeholders[customerChannelSelect.value] || "Contato";
+  });
+}
 
 $("#customer-form").addEventListener("submit", async (event) => {
   event.preventDefault();

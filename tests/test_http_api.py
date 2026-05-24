@@ -561,6 +561,53 @@ class HttpApiIntegrationTests(unittest.TestCase):
         self.assertIn("campaign_id,campaign_name,campaign_status", decoded)
         self.assertIn(campaign_name, decoded)
 
+    def test_26_create_customer_email_channel_and_filter(self):
+        self.ensure_logged_in_master()
+        code, payload = self.request_json("GET", "/api/queues")
+        self.assertEqual(code, 200)
+        queue_id = payload["queues"][0]["id"]
+        unique_email = f"cliente{int(time.time())}@dominio.com"
+
+        code, payload = self.request_json(
+            "POST",
+            "/api/customers",
+            {"name": "Cliente Email", "channel": "email", "contact": unique_email, "queue_id": queue_id},
+        )
+        self.assertEqual(code, 201)
+        self.assertTrue(payload["ok"])
+        created_id = payload["id"]
+
+        code, payload = self.request_json("GET", "/api/customers?channel=email")
+        self.assertEqual(code, 200)
+        row = next((item for item in payload["customers"] if item["id"] == created_id), None)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["channel"], "email")
+        self.assertEqual(row["contact"], unique_email)
+
+    def test_27_webhook_inbound_telegram_creates_customer(self):
+        self.ensure_logged_in_master()
+        handle = f"usuario_telegram_{int(time.time())}"
+        text = "Mensagem recebida do Telegram"
+        code, payload = self.request_json(
+            "POST",
+            "/api/webhook/inbound",
+            {"channel": "telegram", "contact": handle, "name": "Cliente TG", "text": text, "event_id": str(int(time.time()))},
+        )
+        self.assertEqual(code, 200)
+        self.assertTrue(payload["ok"])
+        customer_id = payload["customer_id"]
+
+        code, payload = self.request_json("GET", "/api/customers?channel=telegram")
+        self.assertEqual(code, 200)
+        row = next((item for item in payload["customers"] if item["id"] == customer_id), None)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["channel"], "telegram")
+        self.assertEqual(row["contact"], handle)
+
+        code, payload = self.request_json("GET", f"/api/customers/{customer_id}/messages")
+        self.assertEqual(code, 200)
+        self.assertTrue(any(msg["body"] == text and msg["direction"] == "inbound" for msg in payload["messages"]))
+
 
 if __name__ == "__main__":
     unittest.main()

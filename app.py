@@ -72,6 +72,36 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini")
 SSE_KEEPALIVE_SECONDS = env_int("SSE_KEEPALIVE_SECONDS", 15, minimum=5, maximum=120)
 SSE_SUBSCRIBER_QUEUE_MAX = env_int("SSE_SUBSCRIBER_QUEUE_MAX", 200, minimum=10, maximum=5000)
 
+SUPPORTED_CHANNELS = {
+    "whatsapp",
+    "telegram",
+    "instagram",
+    "facebook_messenger",
+    "email",
+    "webchat",
+}
+CHANNEL_ALIASES = {
+    "wa": "whatsapp",
+    "wpp": "whatsapp",
+    "whats": "whatsapp",
+    "whats_app": "whatsapp",
+    "telegram": "telegram",
+    "instagram": "instagram",
+    "ig": "instagram",
+    "facebook": "facebook_messenger",
+    "facebook_messenger": "facebook_messenger",
+    "facebook-messenger": "facebook_messenger",
+    "messenger": "facebook_messenger",
+    "fecebook_messenger": "facebook_messenger",
+    "email": "email",
+    "e-mail": "email",
+    "mail": "email",
+    "chat": "webchat",
+    "site_chat": "webchat",
+    "website_chat": "webchat",
+    "webchat": "webchat",
+}
+
 SESSIONS = {}
 SESSIONS_LOCK = threading.RLock()
 LOGIN_ATTEMPTS = {}
@@ -302,6 +332,8 @@ def init_db():
                 id integer primary key autoincrement,
                 name text not null,
                 phone text not null unique,
+                channel text not null default 'whatsapp',
+                contact_ref text,
                 queue_id integer not null,
                 assigned_operator_id integer,
                 status text not null default 'open' check(status in ('open', 'pending', 'closed')),
@@ -497,6 +529,10 @@ def init_db():
         if "must_change_password" not in user_cols:
             conn.execute("alter table users add column must_change_password integer not null default 0")
         customer_cols = [row["name"] for row in conn.execute("pragma table_info(customers)").fetchall()]
+        if "channel" not in customer_cols:
+            conn.execute("alter table customers add column channel text not null default 'whatsapp'")
+        if "contact_ref" not in customer_cols:
+            conn.execute("alter table customers add column contact_ref text")
         if "finalized" not in customer_cols:
             conn.execute("alter table customers add column finalized integer not null default 0")
         if "erp_provider" not in customer_cols:
@@ -666,6 +702,12 @@ def init_db():
         conn.execute(
             "update customers set sla_due_at = coalesce(sla_due_at, created_at + ?) where sla_due_at is null",
             (DEFAULT_SLA_FIRST_RESPONSE_SECONDS,),
+        )
+        conn.execute(
+            "update customers set channel = coalesce(nullif(channel, ''), 'whatsapp')",
+        )
+        conn.execute(
+            "update customers set contact_ref = coalesce(nullif(contact_ref, ''), phone)",
         )
         conn.execute(
             "update customers set closed_at = coalesce(closed_at, ?) where status = 'closed' and closed_at is null",
@@ -947,12 +989,15 @@ def store_uploaded_file(filename, content_bytes):
     return f"/uploads/{file_name}"
 
 
-def dispatch_outbound_text(phone, text):
+def dispatch_outbound_text(channel, contact_ref, text):
     external_id = None
-    status = "sent"
-    if evolution.configured():
-        response = evolution.send_text(phone, text)
-        external_id = str(response.get("key", {}).get("id") or response.get("messageId") or "")
+    if channel == "whatsapp":
+        status = "sent"
+        if evolution.configured():
+            response = evolution.send_text(contact_ref, text)
+            external_id = str(response.get("key", {}).get("id") or response.get("messageId") or "")
+        return status, external_id
+    status = f"local:{channel}_integration_pending"
     return status, external_id
 
 
@@ -972,7 +1017,7 @@ def process_due_scheduled_messages(limit=50):
         ).fetchall()
         for row in rows:
             customer = conn.execute(
-                "select id, phone, finalized from customers where id = ?",
+                "select id, phone, channel, contact_ref, finalized from customers where id = ?",
                 (row["customer_id"],),
             ).fetchone()
             if not customer:
@@ -989,7 +1034,9 @@ def process_due_scheduled_messages(limit=50):
                 )
                 continue
             try:
-                status, external_id = dispatch_outbound_text(customer["phone"], row["body"])
+                channel = normalize_channel(customer["channel"] or "whatsapp") or "whatsapp"
+                contact_ref = customer["contact_ref"] or customer["phone"]
+                status, external_id = dispatch_outbound_text(channel, contact_ref, row["body"])
                 send_ts = now_ts()
                 conn.execute(
                     """
@@ -1062,7 +1109,7 @@ def process_pending_campaign_dispatches(limit_campaigns=3):
                 target_id = int(target["id"])
                 customer_id = int(target["customer_id"])
                 customer = conn.execute(
-                    "select id, phone, finalized from customers where id = ?",
+                    "select id, phone, channel, contact_ref, finalized from customers where id = ?",
                     (customer_id,),
                 ).fetchone()
                 pref = conn.execute(
@@ -1088,7 +1135,9 @@ def process_pending_campaign_dispatches(limit_campaigns=3):
                     )
                     continue
                 try:
-                    status, external_id = dispatch_outbound_text(customer["phone"], campaign["body"])
+                    channel = normalize_channel(customer["channel"] or "whatsapp") or "whatsapp"
+                    contact_ref = customer["contact_ref"] or customer["phone"]
+                    status, external_id = dispatch_outbound_text(channel, contact_ref, campaign["body"])
                     send_ts = now_ts()
                     conn.execute(
                         """
@@ -1172,10 +1221,11 @@ def process_inbound_payload(payload):
             cursor = conn.execute(
                 """
                 insert into customers
-                (name, phone, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
-                values (?, ?, ?, ?, 'open', ?, ?, ?)
+                (name, phone, channel, contact_ref, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
+                values (?, ?, 'whatsapp', ?, ?, ?, 'open', ?, ?, ?)
                 """,
                 (
+                    phone,
                     phone,
                     phone,
                     queue_id,
@@ -1772,6 +1822,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/webhook/evolution":
                 self.api_webhook_evolution()
                 return
+            if path == "/api/webhook/inbound":
+                self.api_webhook_inbound()
+                return
             if path == "/api/webhook/reprocess":
                 self.api_reprocess_webhooks()
                 return
@@ -1874,9 +1927,15 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         search = f"%{query.get('q', [''])[0].strip()}%"
         status = query.get("status", [""])[0].strip()
+        channel_filter = query.get("channel", [""])[0].strip()
         if status and status not in {"open", "pending", "closed"}:
             self.send_json({"error": "Filtro de status inválido"}, HTTPStatus.BAD_REQUEST)
             return
+        if channel_filter:
+            channel_filter = normalize_channel(channel_filter)
+            if not channel_filter:
+                self.send_json({"error": "Filtro de canal inválido"}, HTTPStatus.BAD_REQUEST)
+                return
         try:
             limit = int(query.get("limit", ["100"])[0])
             offset = int(query.get("offset", ["0"])[0])
@@ -1886,11 +1945,14 @@ class Handler(BaseHTTPRequestHandler):
         limit = max(1, min(limit, 200))
         offset = max(0, offset)
         clause, params = self.visible_customer_clause(user)
-        filters = [clause, "(c.name like ? or c.phone like ?)"]
-        params.extend([search, search])
+        filters = [clause, "(c.name like ? or c.phone like ? or coalesce(c.contact_ref, '') like ?)"]
+        params.extend([search, search, search])
         if status:
             filters.append("c.status = ?")
             params.append(status)
+        if channel_filter:
+            filters.append("c.channel = ?")
+            params.append(channel_filter)
         where_sql = " and ".join(filters)
         params.extend([limit, offset])
         with db() as conn:
@@ -2443,7 +2505,8 @@ class Handler(BaseHTTPRequestHandler):
                     ct.id target_id,
                     ct.customer_id,
                     coalesce(c.name, '') customer_name,
-                    coalesce(c.phone, '') customer_phone,
+                    coalesce(c.channel, 'whatsapp') customer_channel,
+                    coalesce(c.contact_ref, c.phone, '') customer_contact,
                     ct.status,
                     coalesce(ct.last_error, '') last_error,
                     ct.sent_at
@@ -2467,7 +2530,8 @@ class Handler(BaseHTTPRequestHandler):
                 "target_id",
                 "customer_id",
                 "customer_name",
-                "customer_phone",
+                "customer_channel",
+                "customer_contact",
                 "target_status",
                 "last_error",
                 "sent_at",
@@ -2484,7 +2548,8 @@ class Handler(BaseHTTPRequestHandler):
                     row["target_id"],
                     row["customer_id"],
                     row["customer_name"],
-                    row["customer_phone"],
+                    row["customer_channel"],
+                    row["customer_contact"],
                     row["status"],
                     row["last_error"],
                     row["sent_at"] or "",
@@ -2501,13 +2566,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_outbound_for_customer(self, conn, customer_id, text):
-        customer = conn.execute("select id, phone from customers where id = ?", (customer_id,)).fetchone()
+        customer = conn.execute(
+            "select id, phone, channel, contact_ref from customers where id = ?",
+            (customer_id,),
+        ).fetchone()
         if not customer:
             raise APIError(HTTPStatus.NOT_FOUND, "Cliente nao encontrado")
         external_id = None
         status = "sent"
         try:
-            status, external_id = dispatch_outbound_text(customer["phone"], text)
+            channel = normalize_channel(customer["channel"] or "whatsapp") or "whatsapp"
+            contact_ref = customer["contact_ref"] or customer["phone"]
+            status, external_id = dispatch_outbound_text(channel, contact_ref, text)
         except RuntimeError as exc:
             status = f"local: {exc}"
         send_ts = now_ts()
@@ -2741,17 +2811,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         payload = self.read_json()
         name = payload.get("name", "").strip()
-        phone = only_digits(payload.get("phone", ""))
+        channel = normalize_channel(payload.get("channel") or "whatsapp")
+        if not channel:
+            self.send_json({"error": "Canal inválido"}, HTTPStatus.BAD_REQUEST)
+            return
+        contact_input = payload.get("contact", payload.get("phone", ""))
+        contact_ref = normalize_customer_contact(channel, contact_input)
+        if not contact_ref:
+            self.send_json({"error": "Contato inválido para o canal selecionado"}, HTTPStatus.BAD_REQUEST)
+            return
+        customer_key = build_customer_key(channel, contact_ref)
         try:
             queue_id = int(payload.get("queue_id") or 0)
         except (TypeError, ValueError):
             self.send_json({"error": "Fila inválida"}, HTTPStatus.BAD_REQUEST)
             return
-        if not name or not phone or queue_id <= 0:
-            self.send_json({"error": "Nome, telefone e fila são obrigatórios"}, HTTPStatus.BAD_REQUEST)
-            return
-        if len(phone) < 10:
-            self.send_json({"error": "Telefone inválido"}, HTTPStatus.BAD_REQUEST)
+        if not name or queue_id <= 0:
+            self.send_json({"error": "Nome, contato e fila são obrigatórios"}, HTTPStatus.BAD_REQUEST)
             return
         if user["role"] != "admin":
             assigned_operator_id = user["id"]
@@ -2785,13 +2861,23 @@ class Handler(BaseHTTPRequestHandler):
                 cursor = conn.execute(
                     """
                     insert into customers
-                    (name, phone, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
-                    values (?, ?, ?, ?, 'open', ?, ?, ?)
+                    (name, phone, channel, contact_ref, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
+                    values (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
                     """,
-                    (name, phone, queue_id, assigned_operator_id, now_ts(), now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS, now_ts()),
+                    (
+                        name,
+                        customer_key,
+                        channel,
+                        contact_ref,
+                        queue_id,
+                        assigned_operator_id,
+                        now_ts(),
+                        now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS,
+                        now_ts(),
+                    ),
                 )
             except sqlite3.IntegrityError:
-                self.send_json({"error": "Telefone já cadastrado"}, HTTPStatus.CONFLICT)
+                self.send_json({"error": "Contato já cadastrado para este canal"}, HTTPStatus.CONFLICT)
                 return
         log_action(user["id"], "customer.created", {"customer_id": cursor.lastrowid})
         publish_realtime_event(
@@ -3658,6 +3744,99 @@ class Handler(BaseHTTPRequestHandler):
         except RuntimeError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
+    def api_webhook_inbound(self):
+        payload = self.read_json()
+        if WEBHOOK_TOKEN:
+            token = self.headers.get("X-Webhook-Token", "")
+            if token != WEBHOOK_TOKEN:
+                self.send_json({"error": "Webhook token inválido"}, HTTPStatus.FORBIDDEN)
+                return
+        channel = normalize_channel(payload.get("channel"))
+        if not channel:
+            self.send_json({"error": "Canal inválido"}, HTTPStatus.BAD_REQUEST)
+            return
+        contact_input = payload.get("contact", payload.get("from", ""))
+        contact_ref = normalize_customer_contact(channel, contact_input)
+        if not contact_ref:
+            self.send_json({"error": "Contato inválido"}, HTTPStatus.BAD_REQUEST)
+            return
+        text = str(payload.get("text", payload.get("body", ""))).strip()
+        if not text:
+            self.send_json({"error": "Mensagem vazia"}, HTTPStatus.BAD_REQUEST)
+            return
+        customer_name = str(payload.get("name") or contact_ref).strip() or contact_ref
+        external_id = str(payload.get("event_id") or payload.get("external_id") or "")[:128]
+        customer_key = build_customer_key(channel, contact_ref)
+        with db() as conn:
+            customer = conn.execute("select id from customers where phone = ?", (customer_key,)).fetchone()
+            created_new_customer = False
+            if not customer:
+                queue_id = conn.execute("select id from queues order by id limit 1").fetchone()["id"]
+                operator = conn.execute(
+                    """
+                    select u.id, count(c.id) load
+                    from users u
+                    left join customers c on c.assigned_operator_id = u.id and c.status != 'closed'
+                    where u.role = 'operator' and u.active = 1
+                    group by u.id
+                    order by load asc, u.id asc
+                    limit 1
+                    """
+                ).fetchone()
+                cursor = conn.execute(
+                    """
+                    insert into customers
+                    (name, phone, channel, contact_ref, queue_id, assigned_operator_id, status, last_message_at, sla_due_at, created_at)
+                    values (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+                    """,
+                    (
+                        customer_name,
+                        customer_key,
+                        channel,
+                        contact_ref,
+                        queue_id,
+                        operator["id"] if operator else None,
+                        now_ts(),
+                        now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS,
+                        now_ts(),
+                    ),
+                )
+                customer_id = cursor.lastrowid
+                created_new_customer = True
+            else:
+                customer_id = customer["id"]
+            conn.execute(
+                "insert into messages (customer_id, direction, body, external_id, created_at) values (?, 'inbound', ?, ?, ?)",
+                (customer_id, text, external_id, now_ts()),
+            )
+            conn.execute(
+                """
+                update customers
+                set status = 'open',
+                    finalized = 0,
+                    closed_at = null,
+                    last_message_at = ?,
+                    sla_due_at = coalesce(sla_due_at, ?)
+                where id = ?
+                """,
+                (now_ts(), now_ts() + DEFAULT_SLA_FIRST_RESPONSE_SECONDS, customer_id),
+            )
+        METRICS["messages_processed_total"] += 1
+        publish_realtime_event(
+            "ticket.updated",
+            {
+                "customer_id": customer_id,
+                "source": "webhook",
+                "kind": "inbound_message",
+                "channel": channel,
+                "created_new_customer": created_new_customer,
+            },
+            customer_id=customer_id,
+        )
+        self.send_json(
+            {"ok": True, "customer_id": customer_id, "channel": channel, "created_new_customer": created_new_customer}
+        )
+
     def api_webhook_evolution(self):
         payload = self.read_json()
         METRICS["webhook_received_total"] += 1
@@ -3755,11 +3934,59 @@ def customer_payload(row):
         payload["erp_connection_data"] = json.loads(payload.get("erp_connection_data") or "{}")
     except json.JSONDecodeError:
         payload["erp_connection_data"] = {}
+    payload["channel"] = normalize_channel(payload.get("channel") or "whatsapp") or "whatsapp"
+    payload["contact_ref"] = str(payload.get("contact_ref") or payload.get("phone") or "").strip()
+    payload["contact"] = payload["contact_ref"]
     return payload
 
 
 def only_digits(value):
     return "".join(ch for ch in str(value) if ch.isdigit())
+
+
+def normalize_channel(raw_channel):
+    value = str(raw_channel or "").strip().lower().replace(" ", "_")
+    if not value:
+        return ""
+    canonical = CHANNEL_ALIASES.get(value, value)
+    if canonical not in SUPPORTED_CHANNELS:
+        return ""
+    return canonical
+
+
+def normalize_customer_contact(channel, raw_contact):
+    value = str(raw_contact or "").strip()
+    if not value:
+        return ""
+    if channel == "whatsapp":
+        digits = only_digits(value)
+        if len(digits) < 10:
+            return ""
+        return digits
+    if channel == "telegram":
+        candidate = value.lstrip("@")
+    elif channel == "instagram":
+        candidate = value.lstrip("@").lower()
+    elif channel == "facebook_messenger":
+        candidate = value
+    elif channel == "email":
+        candidate = value.lower()
+        if "@" not in candidate or "." not in candidate.split("@", 1)[-1]:
+            return ""
+    elif channel == "webchat":
+        candidate = value
+    else:
+        return ""
+    candidate = candidate.strip()
+    if len(candidate) < 2 or len(candidate) > 160:
+        return ""
+    return candidate
+
+
+def build_customer_key(channel, contact_ref):
+    if channel == "whatsapp":
+        return contact_ref
+    return f"{channel}:{contact_ref}"
 
 
 def main():
